@@ -1,0 +1,10 @@
+psycopg2-binary
+sqlalchemy
+geopandas
+shapely
+requests
+pandas
+numpy
+python-dotenv
+polars
+duckdb

@@ -1,0 +1,86 @@
+services:
+  # PostgreSQL database with PostGIS and MobilityDB extensions
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: serve-robotics-db
+    environment:
+      POSTGRES_USER: robotics_user
+      POSTGRES_PASSWORD: robotics_password
+      POSTGRES_DB: serve_robotics
+      POSTGRES_INITDB_ARGS: "-c shared_preload_libraries=postgis-3"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U robotics_user -d serve_robotics"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - robotics_network
+
+  # Python application for data gathering and simulation
+  python-app:
+    build:
+      context: .
+      dockerfile: Dockerfile.python
+    container_name: serve-robotics-python
+    environment:
+      DATABASE_URL: postgresql://robotics_user:robotics_password@postgres:5432/serve_robotics
+      PYTHONUNBUFFERED: 1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./app:/app
+      - ./data:/app/data
+    networks:
+      - robotics_network
+    command: python3 /app/main.py
+
+  # Web API and Visualization Service
+  web-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.webapi
+    container_name: serve-robotics-api
+    environment:
+      DATABASE_URL: postgresql://robotics_user:robotics_password@postgres:5432/serve_robotics
+      PYTHONUNBUFFERED: 1
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./web_api:/app
+    networks:
+      - robotics_network
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Flet web frontend
+  flet-frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.flet
+    container_name: serve-robotics-frontend
+    environment:
+      # The Flet app resolves the API host by service name inside the Docker network
+      API_BASE_URL: http://web-api:8000
+      WS_BASE_URL: ws://web-api:8000
+      PYTHONUNBUFFERED: 1
+    ports:
+      - "8501:8501"
+    depends_on:
+      - web-api
+    networks:
+      - robotics_network
+
+volumes:
+  postgres_data:
+
+networks:
+  robotics_network:
+    driver: bridge

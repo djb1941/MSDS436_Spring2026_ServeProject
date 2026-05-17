@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Serve Robotics - Project Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --primary: #1f2937;
+            --secondary: #374151;
+            --accent: #3b82f6;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --light: #f3f4f6;
+            --text: #1f2937;
+            color-scheme: light;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            color: var(--text);
+            line-height: 1.6;
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+
+        header {
+            background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+            color: white;
+            padding: 40px 20px;
+            text-align: center;
+        }
+
+        header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+
+        header p {
+            font-size: 1.1em;
+            opacity: 0.9;
+        }
+
+        .status-bar {
+            display: flex;
+            gap: 20px;
+            padding: 20px;
+            background: var(--light);
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-weight: 500;
+        }
+
+        .status-badge {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        .status-badge.healthy {
+            background: var(--success);
+        }
+
+        .status-badge.warning {
+            background: var(--warning);
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .content {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            padding: 30px;
+        }
+
+        @media (max-width: 900px) {
+            .content {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .card {
+            background: white;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 20px;
+            transition: all 0.3s ease;
+        }
+
+        .card:hover {
+            box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+            border-color: var(--accent);
+        }
+
+        .card h2 {
+            color: var(--primary);
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid var(--accent);
+            font-size: 1.3em;
+        }
+
+        .card h3 {
+            color: var(--secondary);
+            margin-top: 15px;
+            margin-bottom: 10px;
+            font-size: 0.95em;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .item-list {
+            list-style: none;
+            margin: 10px 0;
+        }
+
+        .item-list li {
+            padding: 8px 0;
+            padding-left: 25px;
+            position: relative;
+            font-size: 0.95em;
+        }
+
+        .item-list li:before {
+            content: "✓";
+            position: absolute;
+            left: 0;
+            color: var(--success);
+            font-weight: bold;
+        }
+
+        .architecture {
+            background: var(--light);
+            padding: 20px;
+            border-radius: 8px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.85em;
+            overflow-x: auto;
+            margin: 15px 0;
+        }
+
+        .cmd-section {
+            background: var(--primary);
+            color: #10b981;
+            padding: 15px;
+            border-radius: 6px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.85em;
+            margin: 10px 0;
+            overflow-x: auto;
+        }
+
+        .cmd-section code {
+            color: #10b981;
+        }
+
+        .decision-box {
+            background: #fef3c7;
+            border-left: 4px solid var(--warning);
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 4px;
+        }
+
+        .decision-box strong {
+            color: var(--warning);
+        }
+
+        .fullwidth {
+            grid-column: 1 / -1;
+        }
+
+        .service-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin: 15px 0;
+        }
+
+        .service-card {
+            background: var(--light);
+            padding: 15px;
+            border-radius: 6px;
+            border-left: 4px solid var(--accent);
+        }
+
+        .service-card .name {
+            font-weight: bold;
+            color: var(--primary);
+            margin-bottom: 5px;
+        }
+
+        .service-card .status {
+            font-size: 0.85em;
+            color: var(--secondary);
+        }
+
+        .service-card .port {
+            font-family: 'Courier New', monospace;
+            font-size: 0.8em;
+            color: var(--accent);
+            margin-top: 5px;
+        }
+
+        .next-steps {
+            background: #dbeafe;
+            border-left: 4px solid var(--accent);
+            padding: 15px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+
+        .next-steps strong {
+            color: var(--accent);
+        }
+
+        footer {
+            background: var(--light);
+            padding: 20px;
+            text-align: center;
+            font-size: 0.9em;
+            color: var(--secondary);
+            border-top: 1px solid #e5e7eb;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🤖 Serve Robotics Simulation</h1>
+            <p>Master's Level Data Science Project - Full-Stack Containerized Application</p>
+        </header>
+
+        <div class="status-bar">
+            <div class="status-item">
+                <span class="status-badge healthy"></span>
+                <span>PostgreSQL: Healthy</span>
+            </div>
+            <div class="status-item">
+                <span class="status-badge healthy"></span>
+                <span>Web API: Healthy</span>
+            </div>
+            <div class="status-item">
+                <span class="status-badge healthy"></span>
+                <span>Python App: Running</span>
+            </div>
+            <div class="status-item">
+                <span class="status-badge warning"></span>
+                <span>MobilityDB: Pending</span>
+            </div>
+        </div>
+
+        <div class="content">
+            <!-- Current Status -->
+            <div class="card">
+                <h2>📊 Current Status</h2>
+                <h3>Session 001 Complete</h3>
+                <ul class="item-list">
+                    <li>Docker infrastructure created</li>
+                    <li>All 3 containers running</li>
+                    <li>Database schema initialized</li>
+                    <li>API responding to requests</li>
+                    <li>Python app connected to DB</li>
+                </ul>
+                <div class="decision-box">
+                    <strong>⚠️ Next Priority:</strong> Create Dockerfile.postgres for MobilityDB integration
+                </div>
+            </div>
+
+            <!-- Services Overview -->
+            <div class="card">
+                <h2>🐳 Running Services</h2>
+                <div class="service-grid">
+                    <div class="service-card">
+                        <div class="name">PostgreSQL</div>
+                        <div class="status">✓ Healthy</div>
+                        <div class="port">Port 5432</div>
+                    </div>
+                    <div class="service-card">
+                        <div class="name">Web API</div>
+                        <div class="status">✓ Healthy</div>
+                        <div class="port">Port 8000</div>
+                    </div>
+                    <div class="service-card">
+                        <div class="name">Python App</div>
+                        <div class="status">✓ Running</div>
+                        <div class="port">Internal</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Architecture -->
+            <div class="card fullwidth">
+                <h2>🏗️ Architecture</h2>
+                <div class="architecture">
+Docker Network: robotics_network
+├── PostgreSQL + PostGIS (Port 5432)
+│   ├── robots table
+│   ├── restaurants table
+│   ├── residences table
+│   ├── deliveries table
+│   └── robot_locations table
+├── Python App
+│   ├── Data gathering module
+│   ├── Simulation engine
+│   └── DB writer
+└── Web API (Port 8000)
+    ├── /health
+    ├── /api/v1/robots
+    ├── /api/v1/deliveries
+    ├── /api/v1/restaurants
+    ├── /api/v1/map
+    └── /api/v1/stats
+                </div>
+            </div>
+
+            <!-- Key Decisions -->
+            <div class="card">
+                <h2>🎯 Key Decisions Made</h2>
+                <h3>Technology Stack</h3>
+                <ul class="item-list">
+                    <li>Fedora 40 (aligns with RHEL career)</li>
+                    <li>dnf package manager</li>
+                    <li>PostgreSQL + PostGIS</li>
+                    <li>FastAPI framework</li>
+                    <li>Python 3.11</li>
+                </ul>
+                <h3>Architectural</h3>
+                <ul class="item-list">
+                    <li>Separate service containers</li>
+                    <li>Internal Docker network</li>
+                    <li>No version pinning (initially)</li>
+                    <li>Health checks on services</li>
+                </ul>
+            </div>
+
+            <!-- Commands Reference -->
+            <div class="card">
+                <h2>⌨️ Essential Commands</h2>
+                <h3>Startup</h3>
+                <div class="cmd-section">
+<code>cd serve/
+docker-compose build
+docker-compose up -d</code>
+                </div>
+                <h3>Monitoring</h3>
+                <div class="cmd-section">
+<code>docker-compose ps
+docker-compose logs -f
+docker-compose logs python-app</code>
+                </div>
+                <h3>Testing</h3>
+                <div class="cmd-section">
+<code>curl http://localhost:8000/health
+docker-compose exec postgres psql -U robotics_user -d serve_robotics</code>
+                </div>
+                <h3>Shutdown</h3>
+                <div class="cmd-section">
+<code>docker-compose down
+docker-compose down -v  # Remove data</code>
+                </div>
+            </div>
+
+            <!-- Next Steps -->
+            <div class="card fullwidth">
+                <h2>📋 Next Steps</h2>
+                <div class="next-steps">
+                    <strong>Session 002 Task: Create Dockerfile.postgres</strong>
+                    <p style="margin-top: 10px;">Need to decide on MobilityDB integration approach:</p>
+                    <ul class="item-list">
+                        <li><strong>Option A:</strong> Try dnf install mobilitydb (fastest)</li>
+                        <li><strong>Option B:</strong> Compile from source (guaranteed)</li>
+                        <li><strong>Option C:</strong> Skip MobilityDB, keep postgis image (practical)</li>
+                    </ul>
+                </div>
+                <h3>Beyond PostgreSQL</h3>
+                <ul class="item-list">
+                    <li>Implement data gathering module</li>
+                    <li>Build discrete event simulation</li>
+                    <li>Create API endpoints</li>
+                    <li>Add visualization</li>
+                    <li>Freeze pip dependencies</li>
+                </ul>
+            </div>
+
+            <!-- Project Info -->
+            <div class="card">
+                <h2>ℹ️ Project Info</h2>
+                <h3>Objective</h3>
+                <p>Build a full-stack containerized application demonstrating discrete event simulation for Serve Robotics autonomous delivery.</p>
+                <h3>Focus Area</h3>
+                <p>Glendale, California - point-to-point robot delivery simulation</p>
+                <h3>Key Deliverables</h3>
+                <ul class="item-list">
+                    <li>Data gathering (Google Maps, OSM)</li>
+                    <li>PostgreSQL schema with geospatial</li>
+                    <li>Discrete event simulation</li>
+                    <li>REST API</li>
+                    <li>Visualization</li>
+                </ul>
+            </div>
+
+            <!-- File Structure -->
+            <div class="card">
+                <h2>📁 File Structure</h2>
+                <div class="architecture">
+serve/
+├── docker-compose.yml
+├── Dockerfile.python
+├── Dockerfile.webapi
+├── init-db.sql
+├── requirements-python.txt
+├── requirements-webapi.txt
+├── .env.example
+├── DOCKER_SETUP.md
+├── DEPLOYMENT_NOTES.txt
+├── SESSION_001_SUMMARY.md
+├── app/
+│   └── main.py
+└── web_api/
+    └── app/
+        └── main.py
+                </div>
+            </div>
+        </div>
+
+        <footer>
+            <p>Serve Robotics Simulation Project • Session 001 • Last Updated: May 2, 2026</p>
+            <p>Reference: SESSION_001_SUMMARY.md for detailed notes</p>
+        </footer>
+    </div>
+</body>
+</html>

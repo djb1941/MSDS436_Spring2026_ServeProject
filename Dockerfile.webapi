@@ -1,0 +1,33 @@
+FROM fedora:40
+
+WORKDIR /app
+
+# Install Python and system dependencies for PostgreSQL and geospatial libraries
+RUN dnf install -y \
+    python3.11 \
+    python3-pip \
+    postgresql \
+    libpq-devel \
+    geos-devel \
+    proj-devel \
+    gdal \
+    && dnf clean all
+
+# Copy requirements
+COPY requirements-webapi.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements-webapi.txt
+
+# Copy application code
+COPY ./web_api ./app
+
+# Expose port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python3 -c "import requests; requests.get('http://localhost:8000/health')" || exit 1
+
+# Default command
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

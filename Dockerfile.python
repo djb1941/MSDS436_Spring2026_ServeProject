@@ -1,0 +1,29 @@
+FROM fedora:40
+
+WORKDIR /app
+
+# Install Python and system dependencies for PostgreSQL and geospatial libraries
+RUN dnf install -y \
+    python3.11 \
+    python3-pip \
+    postgresql \
+    libpq-devel \
+    geos-devel \
+    proj-devel \
+    gdal \
+    && dnf clean all
+
+# Copy requirements
+COPY requirements-python.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements-python.txt
+
+# Copy application code
+COPY ./app .
+
+# Create data directory
+RUN mkdir -p /app/data
+
+# Default command (can be overridden)
+CMD ["python3", "main.py"]

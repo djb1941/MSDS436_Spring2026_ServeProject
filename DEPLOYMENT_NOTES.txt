@@ -1,0 +1,219 @@
+================================================================================
+SERVE ROBOTICS SIMULATION - DEPLOYMENT PREPARATION CHECKLIST
+================================================================================
+
+This document tracks actions needed before final deployment/submission.
+
+================================================================================
+PHASE 1: DEPENDENCY FREEZING
+================================================================================
+Status: [ ] TODO
+
+Before committing final code, freeze all Python package versions:
+
+Steps:
+  1. Set up local Python environment:
+     python3 -m venv venv
+     source venv/bin/activate
+
+  2. Install all requirements:
+     pip install -r requirements-python.txt
+     pip install -r requirements-webapi.txt
+
+  3. Test your application locally to ensure everything works
+
+  4. Capture exact versions installed:
+     pip freeze > requirements-python-frozen.txt
+     pip freeze > requirements-webapi-frozen.txt
+
+  5. Update the actual requirements files with frozen versions:
+     cp requirements-python-frozen.txt requirements-python.txt
+     cp requirements-webapi-frozen.txt requirements-webapi.txt
+
+  6. Commit frozen versions to version control
+
+Why: Docker relies on these exact versions for reproducibility. Your professor
+needs to be able to run your code and get identical results.
+
+================================================================================
+PHASE 2: CODE COMPLETION & TESTING
+================================================================================
+Status: [ ] TODO
+
+Ensure all project components are implemented:
+
+Data Gathering Module (app/data_gathering/):
+  [ ] Fetch restaurants from Google Maps API
+  [ ] Fetch residences from OpenStreetMap API
+  [ ] Store location data in PostgreSQL
+  [ ] Handle API rate limits and errors
+  [ ] Document data sources and collection methodology
+
+Discrete Event Simulation (app/simulation/):
+  [ ] Design robot movement model
+  [ ] Implement point-to-point pathfinding
+  [ ] Model delivery workflow
+  [ ] Track robot battery/energy
+  [ ] Store spatio-temporal data in PostgreSQL
+  [ ] Validate simulation results
+
+Database Schema (init-db.sql):
+  [ ] Verify all tables are created correctly
+  [ ] Confirm PostGIS geometry columns are proper
+  [ ] Test spatial queries (distance, within, intersection)
+  [ ] Verify indexes for performance
+
+Web API (web_api/app/):
+  [ ] Implement all REST endpoints (/api/v1/robots, /api/v1/deliveries, etc.)
+  [ ] Add proper error handling
+  [ ] Add request validation with Pydantic
+  [ ] Test all endpoints with sample data
+
+Visualization:
+  [ ] Create map visualization in web API
+  [ ] Display robot locations and movements
+  [ ] Show delivery statistics
+  [ ] Make it visually understandable for presentation
+
+================================================================================
+PHASE 3: DOCKER VALIDATION
+================================================================================
+Status: [ ] TODO
+
+Ensure Docker setup works end-to-end:
+
+  [ ] Build all Docker images:
+      docker-compose build
+
+  [ ] Start all services:
+      docker-compose up -d
+
+  [ ] Verify database initialization:
+      docker-compose exec postgres psql -U robotics_user -d serve_robotics \
+        -c "SELECT table_name FROM information_schema.tables WHERE table_schema='robotics';"
+
+  [ ] Test Python app runs without errors:
+      docker-compose logs python-app
+
+  [ ] Test Web API health check:
+      curl http://localhost:8000/health
+
+  [ ] Test API endpoints return data:
+      curl http://localhost:8000/api/v1/stats
+
+  [ ] Verify database contains simulation results:
+      docker-compose exec postgres psql -U robotics_user -d serve_robotics \
+        -c "SELECT COUNT(*) FROM robotics.robot_locations;"
+
+  [ ] Check logs for any warnings or errors:
+      docker-compose logs
+
+  [ ] Tear down and clean rebuild to ensure reproducibility:
+      docker-compose down -v
+      docker-compose build --no-cache
+      docker-compose up -d
+
+================================================================================
+PHASE 4: DOCUMENTATION
+================================================================================
+Status: [ ] TODO
+
+Prepare documentation for submission:
+
+Code Documentation:
+  [ ] Add docstrings to all Python modules
+  [ ] Document function parameters and return values
+  [ ] Explain algorithm logic in comments
+  [ ] Add usage examples in README
+
+Project Documentation:
+  [ ] Update DOCKER_SETUP.md with any changes
+  [ ] Create README.md with project overview
+  [ ] Document the discrete event simulation model
+  [ ] Explain data sources and collection process
+  [ ] Document database schema and queries
+
+API Documentation:
+  [ ] Document all REST endpoints
+  [ ] Show example requests/responses
+  [ ] Document error codes
+  [ ] Explain pagination/filtering if applicable
+
+Architecture Documentation:
+  [ ] Diagram the system components
+  [ ] Explain containerization decisions
+  [ ] Document technology choices (why Fedora, why PostgreSQL, etc.)
+  [ ] Explain trade-offs made
+
+================================================================================
+PHASE 5: PERFORMANCE & OPTIMIZATION
+================================================================================
+Status: [ ] TODO
+
+Before final submission:
+
+  [ ] Run simulation with realistic data volumes
+  [ ] Profile code for bottlenecks:
+      python -m cProfile -s cumtime app/main.py
+
+  [ ] Verify database queries are optimized
+  [ ] Check Docker image sizes (should be reasonable)
+  [ ] Verify API response times are acceptable
+  [ ] Test with edge cases (empty delivery list, many robots, etc.)
+  [ ] Memory usage is acceptable in containers
+
+================================================================================
+PHASE 6: FINAL VALIDATION & SUBMISSION
+================================================================================
+Status: [ ] TODO
+
+Final checklist before submission:
+
+  [ ] All code committed to version control
+  [ ] Frozen requirements files committed
+  [ ] No hardcoded credentials (use .env)
+  [ ] .env file NOT in version control (only .env.example)
+  [ ] README explains how to run the project
+  [ ] Project runs from scratch: docker-compose up -d
+  [ ] All endpoints tested and working
+  [ ] Database contains expected data
+  [ ] No errors in docker logs
+  [ ] Documentation complete
+  [ ] Performance acceptable
+  [ ] Ready for professor to run and evaluate
+
+Launch Command for Professor:
+  cd serve/
+  docker-compose build
+  docker-compose up -d
+  curl http://localhost:8000/api/v1/stats
+  # Should return simulation statistics
+
+================================================================================
+NOTES & DECISIONS LOG
+================================================================================
+
+Technology Choices Made:
+- Base OS: Fedora 40 (aligns with RHEL career focus)
+- Package Manager: dnf (instead of apt-get)
+- Database: PostgreSQL with PostGIS (geospatial queries)
+- Python Framework: FastAPI (modern, async, easy to document)
+- Python Version: 3.11 (stable, good library support)
+- No pinned versions initially (flexibility, pip resolves at build time)
+
+Known Limitations/TODOs:
+- [ ] PostgreSQL still uses Debian-based image (official image doesn't have Fedora variant)
+- [ ] MobilityDB extension commented out (may need additional setup)
+- [ ] Geospatial visualization could be enhanced with real-time updates
+
+Design Decisions:
+- Separate services for database, simulation, API (separation of concerns)
+- Docker network isolation (database not exposed to outside)
+- Health checks to ensure service readiness
+- Volume mounts for development (hot reload)
+
+================================================================================
+Last Updated: [DATE]
+Status: In Development
+Next Step: [WHAT TO WORK ON NEXT]
+================================================================================

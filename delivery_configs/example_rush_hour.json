@@ -1,0 +1,37 @@
+{
+  "simulation": {
+    "name": "Rush Hour Scenario",
+    "duration_hours": 24,
+    "start_time": "06:00"
+  },
+  "delivery_generation": {
+    "type": "poisson",
+    "base_rate": 0.5,
+    "peak_hours": {
+      "lunch": {
+        "start_hour": 11,
+        "end_hour": 13,
+        "multiplier": 3.0
+      },
+      "dinner": {
+        "start_hour": 17,
+        "end_hour": 19,
+        "multiplier": 2.5
+      }
+    }
+  },
+  "robot_config": {
+    "num_robots": 10,
+    "speed_mph": 5.0,
+    "starting_location": "glendale_police_station"
+  },
+  "location_distribution": {
+    "restaurants": {
+      "sample_count": 50,
+      "clustering": "high"
+    },
+    "residences": {
+      "distribution": "uniform"
+    }
+  }
+}

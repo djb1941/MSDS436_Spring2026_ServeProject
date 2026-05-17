@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+.eggs/
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment / secrets
+*.env
+.env.*
+!.env.example
+secrets/
+*.secret
+
+# Docker
+.dockerignore
+
+# Database / data files
+*.db
+*.sqlite
+*.sqlite3
+*.duckdb
+postgres_data/
+pgdata/
+data/
+
+# Logs
+*.log
+logs/
+
+# OS artifacts
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Coverage / testing
+htmlcov/
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+nosetests.xml
+coverage.xml
+*.cover
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
