@@ -7,6 +7,7 @@ WebSocket endpoints for real-time robot and delivery streaming.
 import asyncio
 import json
 import logging
+import random
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -139,6 +140,56 @@ async def get_simulation_results(sim_id: int):
     }
 
 # ---------------------------------------------------------------------------
+# Demo robot simulation — bounces N robots around the LA area until real
+# simulation engine writes to the database.
+# ---------------------------------------------------------------------------
+
+_STATUSES = ["traveling", "traveling", "traveling", "at_restaurant", "at_residence", "idle"]
+
+class _DemoRobots:
+    """Lightweight per-simulation state for demo robot movement."""
+
+    def __init__(self, n: int = 5):
+        self.bots = [
+            {
+                "robot_id": i,
+                "lat":  34.10 + random.uniform(-0.08, 0.08),
+                "lon": -118.25 + random.uniform(-0.08, 0.08),
+                "vlat": random.uniform(-0.0010, 0.0010),
+                "vlon": random.uniform(-0.0010, 0.0010),
+                "status": random.choice(_STATUSES),
+                "tick": random.randint(0, 39),
+            }
+            for i in range(n)
+        ]
+
+    def step(self) -> list[dict]:
+        out = []
+        for b in self.bots:
+            b["lat"] += b["vlat"]
+            b["lon"] += b["vlon"]
+            b["tick"] += 1
+            if not (34.08 <= b["lat"] <= 34.22):
+                b["vlat"] *= -1
+                b["lat"] = max(34.08, min(34.22, b["lat"]))
+            if not (-118.35 <= b["lon"] <= -118.16):
+                b["vlon"] *= -1
+                b["lon"] = max(-118.35, min(-118.16, b["lon"]))
+            if b["tick"] % 40 == 0:
+                b["vlat"] = random.uniform(-0.0010, 0.0010)
+                b["vlon"] = random.uniform(-0.0010, 0.0010)
+                b["status"] = random.choice(_STATUSES)
+            out.append({
+                "robot_id": b["robot_id"],
+                "lat":    round(b["lat"], 6),
+                "lon":    round(b["lon"], 6),
+                "status": b["status"],
+            })
+        return out
+
+_demo_robots: dict[int, _DemoRobots] = {}
+
+# ---------------------------------------------------------------------------
 # WebSocket: real-time robot position stream
 # ---------------------------------------------------------------------------
 # The Flet frontend opens this connection once per simulation run and receives
@@ -164,19 +215,19 @@ async def ws_robot_positions(websocket: WebSocket, sim_id: int):
     """
     await websocket.accept()
     logger.info(f"WebSocket client connected: robot feed for sim_id={sim_id}")
+    if sim_id not in _demo_robots:
+        _demo_robots[sim_id] = _DemoRobots(n=5)
+    sim = _demo_robots[sim_id]
     try:
         sim_time = 0.0
         while True:
-            # TODO: Replace stub with a real DB query:
-            #   SELECT robot_id, latitude, longitude, status
-            #   FROM robotics.robot_locations
-            #   WHERE simulation_id = %s AND timestamp > %s
-            #   ORDER BY timestamp DESC LIMIT 1 per robot
+            # TODO: replace demo step() with a real DB query once the
+            # simulation engine writes to robotics.robot_locations.
             payload = {
                 "type": "robot_update",
                 "simulation_id": sim_id,
                 "sim_time_s": sim_time,
-                "robots": [],  # populated once DB writes are live
+                "robots": sim.step(),
             }
             await websocket.send_text(json.dumps(payload))
             sim_time += 1.0

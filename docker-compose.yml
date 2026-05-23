@@ -21,7 +21,7 @@ services:
     networks:
       - robotics_network
 
-  # Python application for data gathering and simulation
+  # Python application — simulation engine + Flet web UI (port 8501)
   python-app:
     build:
       context: .
@@ -29,16 +29,23 @@ services:
     container_name: serve-robotics-python
     environment:
       DATABASE_URL: postgresql://robotics_user:robotics_password@postgres:5432/serve_robotics
+      # Flet talks to the web-api service by its Docker network name
+      API_BASE_URL: http://web-api:8000
+      WS_BASE_URL: ws://web-api:8000
       PYTHONUNBUFFERED: 1
+    ports:
+      - "8501:8501"
     depends_on:
       postgres:
         condition: service_healthy
+      web-api:
+        condition: service_started
     volumes:
       - ./app:/app
+      - ./frontend:/app/frontend
       - ./data:/app/data
     networks:
       - robotics_network
-    command: python3 /app/main.py
 
   # Web API and Visualization Service
   web-api:
@@ -59,24 +66,6 @@ services:
     networks:
       - robotics_network
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-
-  # Flet web frontend
-  flet-frontend:
-    build:
-      context: .
-      dockerfile: Dockerfile.flet
-    container_name: serve-robotics-frontend
-    environment:
-      # The Flet app resolves the API host by service name inside the Docker network
-      API_BASE_URL: http://web-api:8000
-      WS_BASE_URL: ws://web-api:8000
-      PYTHONUNBUFFERED: 1
-    ports:
-      - "8501:8501"
-    depends_on:
-      - web-api
-    networks:
-      - robotics_network
 
 volumes:
   postgres_data:

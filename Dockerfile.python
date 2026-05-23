@@ -19,11 +19,18 @@ COPY requirements-python.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements-python.txt
 
-# Copy application code
-COPY ./app .
+# Copy simulation engine
+COPY ./app /app/
+
+# Copy Flet frontend
+COPY ./frontend /app/frontend/
+
+RUN chmod +x /app/start.sh
 
 # Create data directory
 RUN mkdir -p /app/data
 
-# Default command (can be overridden)
-CMD ["python3", "main.py"]
+EXPOSE 8501
+
+# Start both the simulation engine and the Flet web UI
+CMD ["/app/start.sh"]

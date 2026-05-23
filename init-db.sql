@@ -35,16 +35,29 @@ CREATE TABLE robotics.robots (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Simulations table (one row per simulation run)
+CREATE TABLE robotics.simulations (
+    id SERIAL PRIMARY KEY,
+    config_name VARCHAR(255),
+    num_robots INT NOT NULL DEFAULT 5,
+    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP,
+    total_deliveries INT,
+    total_distance_km FLOAT,
+    status VARCHAR(50) DEFAULT 'running'  -- 'running', 'completed', 'failed'
+);
+
 -- Deliveries table
 CREATE TABLE robotics.deliveries (
     id SERIAL PRIMARY KEY,
+    simulation_id INT NOT NULL REFERENCES robotics.simulations(id),
     robot_id INTEGER NOT NULL REFERENCES robotics.robots(id),
     restaurant_id INTEGER NOT NULL REFERENCES robotics.restaurants(id),
     residence_id INTEGER NOT NULL REFERENCES robotics.residences(id),
-    start_time TIMESTAMP NOT NULL,
-    end_time TIMESTAMP,
-    status VARCHAR(50) DEFAULT 'pending',
-    distance_meters FLOAT,
+    requested_at TIMESTAMP NOT NULL,
+    picked_up_at TIMESTAMP,
+    delivered_at TIMESTAMP,
+    distance_km FLOAT,
     duration_seconds INTEGER,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -52,9 +65,12 @@ CREATE TABLE robotics.deliveries (
 -- Robot locations history (spatio-temporal data)
 CREATE TABLE robotics.robot_locations (
     id SERIAL PRIMARY KEY,
+    simulation_id INT NOT NULL REFERENCES robotics.simulations(id),
     robot_id INTEGER NOT NULL REFERENCES robotics.robots(id),
     location GEOMETRY(Point, 4326) NOT NULL,
     timestamp TIMESTAMP NOT NULL,
+    status VARCHAR(50) DEFAULT 'idle',  -- 'traveling', 'at_restaurant', 'at_residence', 'idle'
+    delivery_id INT REFERENCES robotics.deliveries(id),
     speed_mps FLOAT,
     heading_degrees FLOAT
 );
@@ -62,7 +78,9 @@ CREATE TABLE robotics.robot_locations (
 -- Create indexes for performance
 CREATE INDEX idx_robot_locations_robot_id ON robotics.robot_locations(robot_id);
 CREATE INDEX idx_robot_locations_timestamp ON robotics.robot_locations(timestamp);
+CREATE INDEX idx_robot_locations_sim_time ON robotics.robot_locations(simulation_id, timestamp);
 CREATE INDEX idx_robot_locations_geom ON robotics.robot_locations USING GIST(location);
+CREATE INDEX idx_deliveries_simulation_id ON robotics.deliveries(simulation_id);
 CREATE INDEX idx_restaurants_location ON robotics.restaurants USING GIST(location);
 CREATE INDEX idx_residences_location ON robotics.residences USING GIST(location);
 

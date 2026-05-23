@@ -8,3 +8,10 @@ numpy
 python-dotenv
 polars
 duckdb
+osmnx
+networkx
+# Flet frontend (web UI served on port 8501)
+flet
+flet-map
+httpx
+websockets
