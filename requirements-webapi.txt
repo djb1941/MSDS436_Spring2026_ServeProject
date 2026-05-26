@@ -1,10 +1,5 @@
 fastapi
 uvicorn[standard]
 psycopg2-binary
-sqlalchemy
-geopandas
-shapely
 pydantic
-pydantic-settings
 python-dotenv
-folium

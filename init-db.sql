@@ -1,8 +1,8 @@
 -- Enable PostGIS extension
 CREATE EXTENSION IF NOT EXISTS postgis;
 
--- Enable MobilityDB extension (if available in the image)
--- CREATE EXTENSION IF NOT EXISTS mobilitydb;
+-- Enable MobilityDB extension (included in mobilitydb/mobilitydb image)
+CREATE EXTENSION IF NOT EXISTS mobilitydb;
 
 -- Create schema for the simulation
 CREATE SCHEMA IF NOT EXISTS robotics;
@@ -40,11 +40,14 @@ CREATE TABLE robotics.simulations (
     id SERIAL PRIMARY KEY,
     config_name VARCHAR(255),
     num_robots INT NOT NULL DEFAULT 5,
-    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    duration_hours FLOAT NOT NULL DEFAULT 24,
+    started_at TIMESTAMP,               -- set by engine when claimed, not at insert time
     completed_at TIMESTAMP,
     total_deliveries INT,
     total_distance_km FLOAT,
-    status VARCHAR(50) DEFAULT 'running'  -- 'running', 'completed', 'failed'
+    status VARCHAR(50) DEFAULT 'pending', -- 'pending', 'running', 'completed', 'failed', 'stopped'
+    real_time BOOLEAN DEFAULT FALSE,      -- FALSE = run as fast as possible
+    speed_factor FLOAT DEFAULT 1.0        -- sim minutes per wall-clock second (real_time only)
 );
 
 -- Deliveries table
@@ -73,6 +76,16 @@ CREATE TABLE robotics.robot_locations (
     delivery_id INT REFERENCES robotics.deliveries(id),
     speed_mps FLOAT,
     heading_degrees FLOAT
+);
+
+-- Active routes — one row per robot, upserted each time a robot starts a new leg.
+-- Cleared when the robot goes idle. The frontend uses this to draw live polylines.
+CREATE TABLE robotics.active_routes (
+    robot_id    INTEGER PRIMARY KEY REFERENCES robotics.robots(id),
+    simulation_id INT NOT NULL REFERENCES robotics.simulations(id),
+    leg_type    VARCHAR(20) NOT NULL,   -- 'to_restaurant' | 'to_residence'
+    route_coords JSONB NOT NULL,        -- [[lat, lon], [lat, lon], ...]
+    updated_at  TIMESTAMP DEFAULT NOW()
 );
 
 -- Create indexes for performance

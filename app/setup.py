@@ -250,6 +250,34 @@ def _build_address(row) -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def apply_migrations(conn):
+    """Idempotent schema migrations for columns added after initial deploy."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            ALTER TABLE robotics.simulations
+            ADD COLUMN IF NOT EXISTS duration_hours FLOAT DEFAULT 24
+        """)
+        cur.execute("""
+            ALTER TABLE robotics.simulations
+            ADD COLUMN IF NOT EXISTS real_time BOOLEAN DEFAULT FALSE
+        """)
+        cur.execute("""
+            ALTER TABLE robotics.simulations
+            ADD COLUMN IF NOT EXISTS speed_factor FLOAT DEFAULT 1.0
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS robotics.active_routes (
+                robot_id      INTEGER PRIMARY KEY REFERENCES robotics.robots(id),
+                simulation_id INT NOT NULL REFERENCES robotics.simulations(id),
+                leg_type      VARCHAR(20) NOT NULL,
+                route_coords  JSONB NOT NULL,
+                updated_at    TIMESTAMP DEFAULT NOW()
+            )
+        """)
+    conn.commit()
+    log.info("Schema migrations applied.")
+
+
 def main():
     log.info("=" * 60)
     log.info("Serve Robotics — Data Setup")
@@ -258,10 +286,11 @@ def main():
     # Step 1: Road network (no DB connection needed)
     setup_road_network()
 
-    # Steps 2 & 3: Location data into PostGIS
+    # Steps 2–4: Location data + schema migrations
     log.info("Connecting to PostgreSQL …")
     conn = get_db_connection()
     try:
+        apply_migrations(conn)
         setup_restaurants(conn)
         setup_residences(conn)
     finally:

@@ -9,6 +9,9 @@
 
 set -e
 
+echo "[start.sh] Running one-time data setup (idempotent — skips if already done)..."
+python3 /app/setup.py
+
 echo "[start.sh] Starting Flet web UI on port 8501..."
 python3 /app/frontend/app/main.py &
 FLET_PID=$!

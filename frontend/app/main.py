@@ -129,6 +129,31 @@ def build_controls_view(state: AppState, page: ft.Page) -> ft.Column:
         width=300,
     )
 
+    real_time_switch = ft.Switch(
+        label="Real-time mode",
+        value=False,
+        active_color=TEAL,
+    )
+
+    speed_factor = ft.TextField(
+        label="Sim speed (minutes/sec)",
+        value="1",
+        hint_text="e.g. 1 = 1 sim-min per sec, 10 = faster",
+        keyboard_type=ft.KeyboardType.NUMBER,
+        color=TEXT_MAIN,
+        bgcolor=BG_SURFACE,
+        border_color=TEAL,
+        focused_border_color=TEAL,
+        width=300,
+        disabled=True,   # only active when real-time mode is on
+    )
+
+    def on_realtime_toggle(e):
+        speed_factor.disabled = not real_time_switch.value
+        page.update()
+
+    real_time_switch.on_change = on_realtime_toggle
+
     status_text = ft.Text("", color=TEXT_DIM, size=13, italic=True)
 
     # --- Past simulations list (polled on load) ------------------------------
@@ -177,9 +202,11 @@ def build_controls_view(state: AppState, page: ft.Page) -> ft.Column:
 
     def start_simulation(e):
         payload = {
-            "config_name": config_name.value.strip() or "rush_hour",
-            "num_robots": int(num_robots.value or 5),
-            "duration_hours": int(duration_hours.value or 24),
+            "config_name":  config_name.value.strip() or "default",
+            "num_robots":   int(num_robots.value or 5),
+            "duration_hours": float(duration_hours.value or 24),
+            "real_time":    real_time_switch.value,
+            "speed_factor": float(speed_factor.value or 1),
         }
         try:
             resp = httpx.post(f"{API_BASE}/api/v1/simulations/start",
@@ -245,6 +272,9 @@ def build_controls_view(state: AppState, page: ft.Page) -> ft.Column:
                     config_name,
                     num_robots,
                     duration_hours,
+                    ft.Divider(color=BG_SURFACE),
+                    real_time_switch,
+                    speed_factor,
                     ft.Row([start_btn, stop_btn], spacing=12),
                     status_text,
                 ]),
@@ -639,27 +669,32 @@ def build_map_view(state: AppState, page: ft.Page) -> ft.Column:
             ),
         )
 
-    # Build the marker layer with an empty list initially.
-    # refresh_map() replaces markers as WebSocket updates arrive.
-    marker_layer = fmap.MarkerLayer(markers=[])
+    # Route color by leg type — matches the marker status colors
+    ROUTE_COLORS = {
+        "to_restaurant": ORANGE,
+        "to_residence":  GREEN,
+    }
 
-    # The Map control: OSM tile background + robot marker overlay.
+    # Build layers with empty lists initially.
+    # refresh_map() replaces contents as WebSocket updates arrive.
+    polyline_layer = fmap.PolylineLayer(polylines=[])
+    marker_layer   = fmap.MarkerLayer(markers=[])
+
+    # The Map control: OSM tiles → route polylines → robot markers (order matters).
     map_control = fmap.Map(
         expand=True,
         initial_center=fmap.MapLatitudeLongitude(GLENDALE_LAT, GLENDALE_LON),
-        initial_zoom=13,          # Street-level zoom for Glendale
+        initial_zoom=13,
         min_zoom=11,
         max_zoom=18,
         layers=[
             fmap.TileLayer(
-                # Standard OpenStreetMap raster tiles.
-                # {z}/{x}/{y} are filled in by flutter_map for each visible tile.
                 url_template="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-                # OSM tile usage policy requires a User-Agent header.
                 additional_options={
                     "attribution": "© OpenStreetMap contributors",
                 },
             ),
+            polyline_layer,   # drawn below markers so dots sit on top of lines
             marker_layer,
         ],
     )
@@ -668,12 +703,34 @@ def build_map_view(state: AppState, page: ft.Page) -> ft.Column:
     last_updated = ft.Text("", color=TEXT_DIM, size=11, italic=True)
 
     def refresh_map():
-        """Rebuild marker list from state.robots and redraw the map."""
-        markers = [robot_marker(r) for r in state.robots
-                   if r.get("lat") is not None and r.get("lon") is not None]
-        marker_layer.markers = markers
+        """Rebuild markers and route polylines from state.robots and redraw."""
+        valid = [r for r in state.robots
+                 if r.get("lat") is not None and r.get("lon") is not None]
 
-        n = len(markers)
+        # Markers — one per robot, color by status
+        marker_layer.markers = [robot_marker(r) for r in valid]
+
+        # Polylines — one per robot that has an active route
+        lines = []
+        for r in valid:
+            coords    = r.get("route_coords")
+            leg_type  = r.get("leg_type")
+            if not coords or not leg_type:
+                continue
+            color = ROUTE_COLORS.get(leg_type, TEAL)
+            lines.append(
+                fmap.Polyline(
+                    points=[
+                        fmap.MapLatitudeLongitude(lat, lon)
+                        for lat, lon in coords
+                    ],
+                    color=color,
+                    stroke_width=3.0,
+                )
+            )
+        polyline_layer.polylines = lines
+
+        n = len(marker_layer.markers)
         robot_count.value  = f"{n} robot{'s' if n != 1 else ''} active"
         last_updated.value = f"Updated {datetime.datetime.now().strftime('%H:%M:%S')}"
         page.update()
@@ -691,6 +748,12 @@ def build_map_view(state: AppState, page: ft.Page) -> ft.Column:
     def legend_dot(color: str, label: str) -> ft.Row:
         return ft.Row(spacing=6, controls=[
             ft.Container(width=12, height=12, bgcolor=color, border_radius=6),
+            ft.Text(label, color=TEXT_DIM, size=11),
+        ])
+
+    def legend_line(color: str, label: str) -> ft.Row:
+        return ft.Row(spacing=6, controls=[
+            ft.Container(width=20, height=3, bgcolor=color, border_radius=2),
             ft.Text(label, color=TEXT_DIM, size=11),
         ])
 
@@ -715,15 +778,18 @@ def build_map_view(state: AppState, page: ft.Page) -> ft.Column:
                 padding=ft.Padding(left=12, right=12, top=8, bottom=8),
                 bgcolor=BG_CARD,
                 border_radius=8,
-                content=ft.Row(
-                    spacing=24,
-                    controls=[
+                content=ft.Column(spacing=8, controls=[
+                    ft.Row(spacing=24, controls=[
                         legend_dot(TEAL,     "Traveling"),
                         legend_dot(ORANGE,   "At restaurant"),
                         legend_dot(GREEN,    "At residence"),
                         legend_dot(TEXT_DIM, "Idle"),
-                    ],
-                ),
+                    ]),
+                    ft.Row(spacing=24, controls=[
+                        legend_line(ORANGE, "Route → restaurant"),
+                        legend_line(GREEN,  "Route → residence"),
+                    ]),
+                ]),
             ),
         ],
     )
