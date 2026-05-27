@@ -1,0 +1,19 @@
+simulation:
+  name: "Default Scenario"
+  duration_hours: 24
+  start_time: "06:00"       # simulation clock starts at 6am
+
+delivery_generation:
+  type: "poisson"
+  rate: 0.5                 # base rate: 0.5 deliveries per minute (~720/day)
+  peak_hours:
+    - hours: "11:00-13:00"  # lunch rush
+      multiplier: 3.0       # 1.5 deliveries/min during this window
+    - hours: "17:00-19:00"  # dinner rush
+      multiplier: 2.5       # 1.25 deliveries/min during this window
+
+constraints:
+  robots_available: 5
+  max_delivery_time_minutes: 30  # reject orders whose estimated delivery time exceeds this
+  robot_speed_kmh: 6.0           # sidewalk robot cruising speed (~3.7 mph)
+  pickup_minutes: 1.0            # time at restaurant to collect the order
