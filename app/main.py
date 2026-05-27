@@ -36,7 +36,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-GRAPHML_PATH = "/app/data/glendale_network.graphml"
+GRAPHML_PATH = "/app/data/serve_boundary_network_all.graphml"
 CONFIGS_DIR  = "/app/delivery_configs"
 DEFAULT_CONFIG = os.path.join(CONFIGS_DIR, "default.yaml")
 POLL_INTERVAL  = 3  # seconds between DB polls when idle
@@ -123,9 +123,15 @@ def run_simulation(
         config = yaml.safe_load(f)
 
     duration_min = duration_hours * 60
+
+    # Pull robot speed from config; fall back to the RobotAgent default if absent
+    robot_speed_kmh = (
+        config.get("constraints", {}).get("robot_speed_kmh", 6.0)
+    )
+
     logger.info(
-        "Simulation %d: config='%s', %d robots, %.0fh",
-        sim_id, config_name, num_robots, duration_hours,
+        "Simulation %d: config='%s', %d robots, %.0fh, robot speed=%.1f km/h",
+        sim_id, config_name, num_robots, duration_hours, robot_speed_kmh,
     )
 
     # Load road network (cached on disk after first run)
@@ -153,9 +159,25 @@ def run_simulation(
 
     dispatcher = Dispatcher()
 
+    def sim_clock(env, db_writer, until):
+        """
+        Lightweight SimPy process: write current sim time to the DB every
+        sim-minute so the WebSocket can interpolate robot positions without
+        the sim engine emitting a position row on every tick.
+
+        At speed_factor=1 (real-time), 1 sim-minute = 1 wall second, so the
+        WS position is at most 1 second stale — roughly 1.7 m at 6 km/h.
+        """
+        while env.now < until:
+            yield env.timeout(1.0)   # 1 sim-minute
+            db_writer.update_sim_time(env.now * 60)
+
+    env.process(sim_clock(env, db_writer, duration_min))
+
     robots = [
         RobotAgent(env=env, robot_index=i, G=G,
-                   dispatcher=dispatcher, db_writer=db_writer)
+                   dispatcher=dispatcher, db_writer=db_writer,
+                   speed_kmh=robot_speed_kmh)
         for i in range(num_robots)
     ]
     for robot in robots:
@@ -163,6 +185,7 @@ def run_simulation(
 
     generator = DeliveryGenerator(
         env=env, db_url=db_url, config_path=config_path, dispatcher=dispatcher,
+        sim_id=sim_id,
     )
     env.process(generator.run())
 

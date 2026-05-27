@@ -8,15 +8,15 @@ and skips it if so (idempotent).
 What this script does
 ---------------------
 1. Road network
-   - Checks for /app/data/glendale_network.graphml on the Docker volume.
-   - If absent: downloads the Glendale, CA drive network from OpenStreetMap
-     via osmnx and saves it as GraphML.
+   - Checks for /app/data/serve_boundary_network.graphml on the Docker volume.
+   - If absent: downloads the drive network within the custom CA-2 / CA-134 /
+     LA River polygon from OpenStreetMap via osmnx and saves it as GraphML.
    - The simulation engine loads this file at runtime to do NetworkX routing.
 
 2. Restaurants (robotics.restaurants)
    - Checks whether the table already has rows.
-   - If empty: queries OSM for amenity=restaurant within Glendale and inserts
-     each one as a PostGIS Point geometry.
+   - If empty: queries OSM for amenity=restaurant within the simulation boundary
+     and inserts each one as a PostGIS Point geometry.
 
 3. Residences (robotics.residences)
    - Same pattern, using building=residential from OSM.
@@ -35,9 +35,11 @@ import logging
 import os
 import sys
 
+import networkx as nx
 import osmnx as ox
 import psycopg2
 from psycopg2.extras import execute_values
+from shapely.geometry import Polygon as ShapelyPolygon
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -55,16 +57,65 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DATABASE_URL   = os.getenv("DATABASE_URL")
-NETWORK_PATH   = "/app/data/glendale_network.graphml"
-PLACE_NAME     = "Glendale, California, USA"
 
-# OSM network type: "drive" gives us roads robots can travel on.
-# "all" would include footpaths and bike lanes — more realistic for sidewalk
-# robots but much slower to download and route through.
-NETWORK_TYPE   = "drive"
+# The cached GraphML filename encodes which boundary and network type were used.
+# If either changes, rename this file so the old graph isn't reused.
+# "_all" = network_type="all" (roads + service roads + paths + crossings)
+NETWORK_PATH   = "/app/data/serve_boundary_network_all.graphml"
 
-# How many OSM results to cap at. Glendale has ~400 restaurants and ~3,000+
-# residential buildings — these limits keep the DB and simulation manageable.
+# ---------------------------------------------------------------------------
+# Custom simulation boundary
+# ---------------------------------------------------------------------------
+# The simulation area is a rough triangle defined by three geographic features:
+#
+#   North edge — CA-134 (Ventura Freeway), running east-west
+#   East edge  — CA-2 (Glendale Freeway), running south from the 134 interchange
+#                through central Glendale toward Atwater Village
+#   West edge  — Los Angeles River, running south from the 134 through the
+#                Glendale Narrows toward Atwater Village
+#
+# The triangle opens downward: the two northern corners sit on CA-134, and the
+# southern vertex is where CA-2 and the LA River converge near Atwater Village.
+#
+# Vertices (lon, lat) are approximate intersections / terminal points of these
+# three features.  Each comment names the real-world landmark being anchored.
+# Adjust coordinates here if you want to expand or tighten the boundary.
+#
+#  Node  Landmark
+#  ----  -------------------------------------------------------
+#  A     CA-134 × LA River (NW corner, Burbank/Glendale border)
+#  B     CA-134 × CA-2 interchange (NE corner)
+#  C–D   CA-2 (Glendale Freeway) southward through Glendale
+#  E     CA-2 × LA River (south vertex, Atwater Village bridge area)
+#  F–G   LA River northward through Glendale Narrows back to 134
+#
+BOUNDARY_COORDS = [
+    (-118.27945, 34.15291),  # A — CA-134 × LA River (NW)
+    (-118.26446, 34.15619),  # B - CA-134 & Pacific Ave
+    (-118.25794, 34.15663),  # C - CA-134 & Central Ave
+    (-118.24681, 34.15663),  # D - CA-134 & Geneva St
+    (-118.24208, 34.15597),  # E - CA-134 & Glendale Ave
+    (-118.22611, 34.14670),  # F — CA-134 × CA-2 interchange (NE)
+    (-118.22918, 34.13676),  # G - CA-2 @ Verd Oaks Dr
+    (-118.22946, 34.13215),  # H - CA-2 & Round Top Dr
+    (-118.22821, 34.12512),  # I - CA-2 & York Blvd
+    (-118.22978, 34.12128),  # J - CA-2 & Verdugo Rd
+    (-118.23484, 34.11782),  # K - CA-2 & Avenue 36
+    (-118.24418, 34.11326),  # L - CA-2 & San Fernando Rd
+    (-118.25200, 34.10829),  # M - CA-2 × LA River (south vertex, Atwater Village)
+    (-118.25633, 34.10847),  # N - LA River @ Silver Lake Blvd
+    (-118.26127, 34.11020),  # O - LA River @ Garcia St
+    (-118.26557, 34.11348),  # P - LA River & Glendale Blvd
+    (-118.27044, 34.12154),  # Q - LA River & Los Feliz Blvd
+    (-118.27679, 34.14096),  # R - LA River and Colorado St
+    (-118.27945, 34.15291),  # A — close polygon back to NW corner
+]
+
+# Shapely polygon used by all three OSM fetch calls below
+SIMULATION_BOUNDARY = ShapelyPolygon(BOUNDARY_COORDS)
+
+# How many OSM results to cap at. The custom boundary covers most of Glendale
+# plus a slice of Burbank — limits keep the DB and simulation manageable.
 MAX_RESTAURANTS = 500
 MAX_RESIDENCES  = 2000
 
@@ -93,20 +144,41 @@ def table_has_rows(conn, schema: str, table: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def setup_road_network():
-    """Download and cache the Glendale drive network as GraphML."""
+    """Download and cache the drive network inside SIMULATION_BOUNDARY as GraphML."""
     if os.path.exists(NETWORK_PATH):
         log.info("Road network already exists at %s — skipping download.", NETWORK_PATH)
         return
 
-    log.info("Downloading Glendale road network from OpenStreetMap …")
+    log.info("Downloading road network from OpenStreetMap for custom boundary …")
+    log.info("Boundary: CA-134 (north) × CA-2 (east) × LA River (west)")
     log.info("(This takes 30–90 seconds on first run and is cached to disk.)")
 
-    # osmnx downloads the street graph and adds travel-time edge weights.
-    G = ox.graph_from_place(PLACE_NAME, network_type=NETWORK_TYPE)
+    # network_type="all" fetches every edge type: roads, service roads, paths,
+    # at-grade railroad crossings, pedestrian ways, etc.  This is important
+    # because Serve robots travel on sidewalks, not car lanes, and the BNSF/
+    # Metrolink railroad running through the boundary creates a barrier that
+    # the drive-only network cannot cross properly (streets that pass over or
+    # through the railroad are often not in the car graph).
+    G = ox.graph_from_polygon(SIMULATION_BOUNDARY, network_type="all")
 
-    # Add travel_time attribute to every edge so NetworkX can route by time.
-    # osmnx imputes speed from OSM maxspeed tags where available,
-    # falls back to sensible defaults by road type otherwise.
+    # Trim to the largest weakly connected component.  A weakly connected
+    # component is a set of nodes where every node is reachable from every
+    # other ignoring edge direction.  Without this step, small isolated
+    # subgraphs (dead-end blocks, parking lots, etc.) remain in the graph.
+    # ox.nearest_nodes() picks the geometrically closest node regardless of
+    # connectivity, so a restaurant south of the tracks could snap to an
+    # isolated node that routing can't reach — silently producing no route.
+    # Keeping only the largest component ensures every node is reachable.
+    largest_wcc = max(nx.weakly_connected_components(G), key=len)
+    G = G.subgraph(largest_wcc).copy()
+    log.info(
+        "Trimmed to largest connected component: %d nodes retained.",
+        G.number_of_nodes(),
+    )
+
+    # Add travel_time attribute to every edge.  We don't use these values for
+    # routing (robots use their own fixed speed), but osmnx requires them for
+    # the GraphML to be complete and they may be useful for future analysis.
     G = ox.add_edge_speeds(G)
     G = ox.add_edge_travel_times(G)
 
@@ -126,17 +198,17 @@ def setup_road_network():
 # ---------------------------------------------------------------------------
 
 def setup_restaurants(conn):
-    """Fetch Glendale restaurants from OSM and insert into PostGIS."""
+    """Fetch restaurants within SIMULATION_BOUNDARY from OSM and insert into PostGIS."""
     if table_has_rows(conn, "robotics", "restaurants"):
         log.info("robotics.restaurants already populated — skipping.")
         return
 
-    log.info("Fetching restaurants from OpenStreetMap …")
+    log.info("Fetching restaurants from OpenStreetMap within simulation boundary …")
 
-    # ox.features_from_place returns a GeoDataFrame of OSM features.
-    # Each row is one restaurant with geometry and OSM tags as columns.
-    gdf = ox.features_from_place(
-        PLACE_NAME,
+    # features_from_polygon clips OSM results to the polygon — only restaurants
+    # inside the CA-2 / CA-134 / LA River triangle are returned.
+    gdf = ox.features_from_polygon(
+        SIMULATION_BOUNDARY,
         tags={"amenity": "restaurant"},
     )
 
@@ -178,15 +250,15 @@ def setup_restaurants(conn):
 # ---------------------------------------------------------------------------
 
 def setup_residences(conn):
-    """Fetch Glendale residential buildings from OSM and insert into PostGIS."""
+    """Fetch residential buildings within SIMULATION_BOUNDARY from OSM and insert into PostGIS."""
     if table_has_rows(conn, "robotics", "residences"):
         log.info("robotics.residences already populated — skipping.")
         return
 
-    log.info("Fetching residential buildings from OpenStreetMap …")
+    log.info("Fetching residential buildings from OpenStreetMap within simulation boundary …")
 
-    gdf = ox.features_from_place(
-        PLACE_NAME,
+    gdf = ox.features_from_polygon(
+        SIMULATION_BOUNDARY,
         tags={"building": "residential"},
     )
 
@@ -267,11 +339,37 @@ def apply_migrations(conn):
         """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS robotics.active_routes (
-                robot_id      INTEGER PRIMARY KEY REFERENCES robotics.robots(id),
-                simulation_id INT NOT NULL REFERENCES robotics.simulations(id),
-                leg_type      VARCHAR(20) NOT NULL,
-                route_coords  JSONB NOT NULL,
-                updated_at    TIMESTAMP DEFAULT NOW()
+                robot_id             INTEGER PRIMARY KEY REFERENCES robotics.robots(id),
+                simulation_id        INT NOT NULL REFERENCES robotics.simulations(id),
+                leg_type             VARCHAR(20) NOT NULL,
+                route_coords         JSONB NOT NULL,
+                leg_started_at_sim_s FLOAT,
+                updated_at           TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            ALTER TABLE robotics.active_routes
+            ADD COLUMN IF NOT EXISTS leg_started_at_sim_s FLOAT
+        """)
+        cur.execute("""
+            ALTER TABLE robotics.simulations
+            ADD COLUMN IF NOT EXISTS current_sim_time_s FLOAT DEFAULT 0
+        """)
+        # Allow robot_id to be NULL so deliveries can be written at generation
+        # time (before a robot is assigned).  The robot claims the row later.
+        cur.execute("""
+            ALTER TABLE robotics.deliveries
+            ALTER COLUMN robot_id DROP NOT NULL
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS robotics.rejected_deliveries (
+                id SERIAL PRIMARY KEY,
+                simulation_id   INT NOT NULL REFERENCES robotics.simulations(id),
+                restaurant_id   INT NOT NULL REFERENCES robotics.restaurants(id),
+                residence_id    INT NOT NULL REFERENCES robotics.residences(id),
+                requested_at    TIMESTAMP NOT NULL,
+                estimated_minutes FLOAT NOT NULL,
+                reason          VARCHAR(50) NOT NULL
             )
         """)
     conn.commit()

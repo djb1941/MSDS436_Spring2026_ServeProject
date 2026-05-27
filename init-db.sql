@@ -47,14 +47,15 @@ CREATE TABLE robotics.simulations (
     total_distance_km FLOAT,
     status VARCHAR(50) DEFAULT 'pending', -- 'pending', 'running', 'completed', 'failed', 'stopped'
     real_time BOOLEAN DEFAULT FALSE,      -- FALSE = run as fast as possible
-    speed_factor FLOAT DEFAULT 1.0        -- sim minutes per wall-clock second (real_time only)
+    speed_factor FLOAT DEFAULT 1.0,       -- sim minutes per wall-clock second (real_time only)
+    current_sim_time_s FLOAT DEFAULT 0    -- sim engine writes this every ~1 sim-min for WS interpolation
 );
 
 -- Deliveries table
 CREATE TABLE robotics.deliveries (
     id SERIAL PRIMARY KEY,
     simulation_id INT NOT NULL REFERENCES robotics.simulations(id),
-    robot_id INTEGER NOT NULL REFERENCES robotics.robots(id),
+    robot_id INTEGER REFERENCES robotics.robots(id),  -- NULL until a robot claims it
     restaurant_id INTEGER NOT NULL REFERENCES robotics.restaurants(id),
     residence_id INTEGER NOT NULL REFERENCES robotics.residences(id),
     requested_at TIMESTAMP NOT NULL,
@@ -63,6 +64,18 @@ CREATE TABLE robotics.deliveries (
     distance_km FLOAT,
     duration_seconds INTEGER,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Rejected delivery requests — orders that exceeded max_delivery_time_minutes.
+-- Separate from deliveries so the main table stays clean.
+CREATE TABLE robotics.rejected_deliveries (
+    id SERIAL PRIMARY KEY,
+    simulation_id   INT NOT NULL REFERENCES robotics.simulations(id),
+    restaurant_id   INT NOT NULL REFERENCES robotics.restaurants(id),
+    residence_id    INT NOT NULL REFERENCES robotics.residences(id),
+    requested_at    TIMESTAMP NOT NULL,
+    estimated_minutes FLOAT NOT NULL,   -- ETA that caused rejection
+    reason          VARCHAR(50) NOT NULL -- 'exceeds_max_delivery_time'
 );
 
 -- Robot locations history (spatio-temporal data)
@@ -80,12 +93,15 @@ CREATE TABLE robotics.robot_locations (
 
 -- Active routes — one row per robot, upserted each time a robot starts a new leg.
 -- Cleared when the robot goes idle. The frontend uses this to draw live polylines.
+-- leg_started_at_sim_s: sim time (seconds) when this leg began — used by the
+-- WebSocket to interpolate the robot's current position along the route.
 CREATE TABLE robotics.active_routes (
-    robot_id    INTEGER PRIMARY KEY REFERENCES robotics.robots(id),
-    simulation_id INT NOT NULL REFERENCES robotics.simulations(id),
-    leg_type    VARCHAR(20) NOT NULL,   -- 'to_restaurant' | 'to_residence'
-    route_coords JSONB NOT NULL,        -- [[lat, lon], [lat, lon], ...]
-    updated_at  TIMESTAMP DEFAULT NOW()
+    robot_id            INTEGER PRIMARY KEY REFERENCES robotics.robots(id),
+    simulation_id       INT NOT NULL REFERENCES robotics.simulations(id),
+    leg_type            VARCHAR(20) NOT NULL,   -- 'to_restaurant' | 'to_residence'
+    route_coords        JSONB NOT NULL,          -- [[lat, lon], [lat, lon], ...]
+    leg_started_at_sim_s FLOAT,                  -- sim seconds at leg start
+    updated_at          TIMESTAMP DEFAULT NOW()
 );
 
 -- Create indexes for performance

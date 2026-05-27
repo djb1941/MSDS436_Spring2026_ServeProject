@@ -75,30 +75,408 @@ class AppState:
         self.delivery_summary: dict = {"total": 0, "completed": 0, "pending": 0}
         self.recent_deliveries: list[dict] = []
 
+        # Restaurant data: fetched once on load (static), busy state refreshed each WS push
+        self.restaurants: list[dict] = []
+        self.busy_restaurants: dict[int, int] = {}   # restaurant_id → pending_count
+
+        # Active deliveries on leg 2 — one entry per robot heading to a residence
+        self.active_residences: list[dict] = []
+
         # Callbacks registered by view builders so WS threads can trigger redraws
         self.on_robot_update    = None   # callable()
         self.on_delivery_update = None   # callable()
 
 
 # ===========================================================================
-# VIEW 1 — Simulation Controls
+# VIEW 1 — Simulation View and Controls
 # ===========================================================================
 
-def build_controls_view(state: AppState, page: ft.Page) -> ft.Column:
+def build_sim_view(state: AppState, page: ft.Page) -> ft.Column:
     """
-    Form for configuring and launching a simulation run.
+    Two Rows: 
+    (1) Map Display
+    (2) Controls | Dashboard | Robot Log/Status
+
+    (1) Interactive map of Glendale showing live robot positions as markers,
+    built with flet-map on top of OpenStreetMap tiles.
+
+    How it works
+    ------------
+    flet-map wraps Flutter's flutter_map package. The Map control contains:
+      - TileLayer  → fetches OSM raster tiles from the internet at render time;
+                     the browser requests only the tiles visible at the current
+                     zoom level (no tiles are stored locally).
+      - MarkerLayer → a list of Marker objects, each pinned to a lat/lon.
+                     We rebuild this list every time the robot WebSocket pushes
+                     a position update.
+
+    The marker_layer reference is kept so refresh_map() can swap in a new
+    markers list and call page.update() to redraw.
+
+    (2a) Form for configuring and launching a simulation run.
 
     REST endpoints used:
         POST /api/v1/simulations/start   — launch
         POST /api/v1/simulations/{id}/stop — stop
         GET  /api/v1/simulations         — list past runs
+
+    (2b) Summary cards showing live delivery counts + final results.
+
+    REST polling:  GET /api/v1/stats  (every 5 s while running)
+                   GET /api/v1/simulations/{id}/results  (once, after run)
     """
+    # --- Map Setup --------------------------------------------------------
+
+    # Approximate centroid of the simulation boundary (CA-134 / CA-2 / LA River)
+    GLENDALE_LAT = 34.1320
+    GLENDALE_LON = -118.2490
+
+    STATUS_COLORS = {
+        "traveling":     TEAL,
+        "at_restaurant": ORANGE,
+        "at_residence":  GREEN,
+        "idle":          TEXT_DIM,
+    }
+
+    # Restaurant marker colours
+    # Gray  = no active order;  Orange = has at least one pending delivery request
+    RESTAURANT_IDLE_COLOR = "#7F8C8D"
+    RESTAURANT_BUSY_COLOR = ORANGE
+
+    def show_restaurant_info(restaurant: dict):
+        """Open an AlertDialog with name, address, and live delivery status."""
+        rid = restaurant["id"]
+        pending = state.busy_restaurants.get(rid, 0)
+
+        if pending:
+            status_icon  = "⚠"
+            status_text  = f"{pending} pending request{'s' if pending > 1 else ''}"
+            status_color = RESTAURANT_BUSY_COLOR
+        else:
+            status_icon  = "✓"
+            status_text  = "No active requests"
+            status_color = GREEN
+
+        def close(e):
+            dlg.open = False
+            page.update()
+
+        dlg = ft.AlertDialog(
+            bgcolor=BG_CARD,
+            title=ft.Row(spacing=8, controls=[
+                ft.Icon(ft.Icons.RESTAURANT, color=TEAL, size=20),
+                ft.Text(restaurant["name"], color=TEXT_MAIN, size=16,
+                        weight=ft.FontWeight.W_600),
+            ]),
+            content=ft.Column(
+                tight=True,
+                spacing=10,
+                controls=[
+                    ft.Row(spacing=6, controls=[
+                        ft.Icon(ft.Icons.LOCATION_ON, color=TEXT_DIM, size=14),
+                        ft.Text(restaurant.get("address") or "Address unknown",
+                                color=TEXT_DIM, size=13),
+                    ]),
+                    ft.Divider(color=BG_SURFACE),
+                    ft.Row(spacing=6, controls=[
+                        ft.Text(status_icon, size=15, color=status_color),
+                        ft.Text(status_text, color=status_color, size=13,
+                                weight=ft.FontWeight.W_500),
+                    ]),
+                ],
+            ),
+            actions=[
+                ft.TextButton("Close", on_click=close,
+                              style=ft.ButtonStyle(color=TEAL)),
+            ],
+        )
+        page.overlay.append(dlg)
+        dlg.open = True
+        page.update()
+
+    def restaurant_marker(r: dict) -> fmap.Marker:
+        """Small square marker for one restaurant; color reflects busy state."""
+        rid     = r["id"]
+        is_busy = rid in state.busy_restaurants
+        color   = RESTAURANT_BUSY_COLOR if is_busy else RESTAURANT_IDLE_COLOR
+
+        return fmap.Marker(
+            coordinates=fmap.MapLatitudeLongitude(r["lat"], r["lon"]),
+            content=ft.Container(
+                width=18, height=18,
+                bgcolor=color,
+                border_radius=3,
+                border=ft.Border.all(1.5, "#FFFFFF"),
+                tooltip=r["name"],
+                content=ft.Icon(ft.Icons.RESTAURANT, size=10, color="#FFFFFF"),
+                on_click=lambda e, res=r: show_restaurant_info(res),
+            ),
+        )
+
+    def show_residence_info(residence: dict):
+        """Open an AlertDialog with address and robot ETA for a delivery destination."""
+        eta = residence.get("eta_sim_minutes")
+        if eta is not None:
+            eta_str = f"~{eta:.0f} sim min" if eta >= 1 else "< 1 sim min"
+        else:
+            eta_str = "—"
+
+        def close(e):
+            dlg.open = False
+            page.update()
+
+        dlg = ft.AlertDialog(
+            bgcolor=BG_CARD,
+            title=ft.Row(spacing=8, controls=[
+                ft.Icon(ft.Icons.HOME, color=GREEN, size=20),
+                ft.Text("Delivery Destination", color=TEXT_MAIN, size=16,
+                        weight=ft.FontWeight.W_600),
+            ]),
+            content=ft.Column(
+                tight=True,
+                spacing=10,
+                controls=[
+                    ft.Row(spacing=6, controls=[
+                        ft.Icon(ft.Icons.LOCATION_ON, color=TEXT_DIM, size=14),
+                        ft.Text(residence.get("address", "Address unknown"),
+                                color=TEXT_DIM, size=13),
+                    ]),
+                    ft.Divider(color=BG_SURFACE),
+                    ft.Row(spacing=6, controls=[
+                        ft.Icon(ft.Icons.DELIVERY_DINING, color=TEAL, size=14),
+                        ft.Text(f"Robot #{residence['robot_id']}",
+                                color=TEXT_MAIN, size=13),
+                    ]),
+                    ft.Row(spacing=6, controls=[
+                        ft.Icon(ft.Icons.SCHEDULE, color=TEAL, size=14),
+                        ft.Text(f"ETA: {eta_str}", color=TEXT_MAIN, size=13,
+                                weight=ft.FontWeight.W_500),
+                    ]),
+                ],
+            ),
+            actions=[
+                ft.TextButton("Close", on_click=close,
+                              style=ft.ButtonStyle(color=TEAL)),
+            ],
+        )
+        page.overlay.append(dlg)
+        dlg.open = True
+        page.update()
+
+    def residence_marker(r: dict) -> fmap.Marker:
+        """House marker for an active delivery destination; shows affiliated robot number."""
+        robot_id = r["robot_id"]
+        return fmap.Marker(
+            coordinates=fmap.MapLatitudeLongitude(r["residence_lat"], r["residence_lon"]),
+            content=ft.GestureDetector(
+                on_tap=lambda e, res=r: show_residence_info(res),
+                content=ft.Stack(
+                    width=40, height=22,
+                    controls=[
+                        ft.Container(
+                            width=20, height=20,
+                            bgcolor=GREEN,
+                            border_radius=4,
+                            border=ft.Border.all(1.5, "#FFFFFF"),
+                            tooltip=f"Delivery destination · Robot #{robot_id}",
+                            content=ft.Icon(ft.Icons.HOME, size=11, color="#FFFFFF"),
+                        ),
+                        ft.Text(
+                            f"#{robot_id}",
+                            size=8,
+                            color=TEXT_MAIN,
+                            weight=ft.FontWeight.BOLD,
+                            left=23,
+                            top=5,
+                        ),
+                    ],
+                ),
+            ),
+        )
+
+    def robot_marker(r: dict) -> fmap.Marker:
+        """Build a flet-map Marker for one robot dict from the WebSocket."""
+        lat    = r.get("lat", GLENDALE_LAT)
+        lon    = r.get("lon", GLENDALE_LON)
+        status = r.get("status", "idle")
+        rid    = r.get("robot_id", "?")
+        color  = STATUS_COLORS.get(status, TEXT_MAIN)
+
+        return fmap.Marker(
+            # Geographic position of this marker
+            coordinates=fmap.MapLatitudeLongitude(lat, lon),
+            # The visual widget rendered at that position.
+            # A Stack lets us layer a label on top of the dot.
+            content=ft.Stack(
+                width=36, height=36,
+                controls=[
+                    ft.Container(
+                        width=20, height=20,
+                        bgcolor=color,
+                        border_radius=10,
+                        border=ft.Border.all(2, "#FFFFFF"),
+                        margin=ft.Margin(left=8, top=8, right=0, bottom=0),
+                        tooltip=f"Robot #{rid} — {status}",
+                    ),
+                    ft.Text(
+                        f"#{rid}",
+                        size=9,
+                        color="#FFFFFF",
+                        weight=ft.FontWeight.BOLD,
+                        left=11, top=11,
+                    ),
+                ],
+            ),
+        )
+
+    # Route color by leg type — matches the marker status colors
+    ROUTE_COLORS = {
+        "to_restaurant": ORANGE,
+        "to_residence":  GREEN,
+    }
+
+    # --- Simulation boundary polygon ----------------------------------------
+    # Mirrors BOUNDARY_COORDS in setup.py (lon, lat) → fmap (lat, lon).
+    # Closing coordinate omitted — flet-map closes the polygon automatically.
+    # Layer order: boundary fill first so routes and markers sit on top of it.
+    BOUNDARY_POINTS = [
+        fmap.MapLatitudeLongitude(34.15291, -118.27945),  # A — CA-134 × LA River (NW)
+        fmap.MapLatitudeLongitude(34.15619, -118.26446),  # B - CA-134 & Pacific Ave
+        fmap.MapLatitudeLongitude(34.15663, -118.25794),  # C - CA-134 & Central Ave
+        fmap.MapLatitudeLongitude(34.15663, -118.24681),  # D - CA-134 & Geneva St
+        fmap.MapLatitudeLongitude(34.15597, -118.24208),  # E - CA-134 & Glendale Ave
+        fmap.MapLatitudeLongitude(34.14670, -118.22611),  # F — CA-134 × CA-2 interchange (NE)
+        fmap.MapLatitudeLongitude(34.13676, -118.22918),  # G - CA-2 @ Verd Oaks Dr
+        fmap.MapLatitudeLongitude(34.13215, -118.22946),  # H - CA-2 & Round Top Dr
+        fmap.MapLatitudeLongitude(34.12512, -118.22821),  # I - CA-2 & York Blvd
+        fmap.MapLatitudeLongitude(34.12128, -118.22978),  # J - CA-2 & Verdugo Rd
+        fmap.MapLatitudeLongitude(34.11782, -118.23484),  # K - CA-2 & Avenue 36
+        fmap.MapLatitudeLongitude(34.11326, -118.24418),  # L - CA-2 & San Fernando Rd
+        fmap.MapLatitudeLongitude(34.10829, -118.25200),  # M - CA-2 × LA River (south vertex, Atwater Village)
+        fmap.MapLatitudeLongitude(34.10847, -118.25633),  # N - LA River @ Silver Lake Blvd
+        fmap.MapLatitudeLongitude(34.11020, -118.26127),  # O - LA River @ Garcia St
+        fmap.MapLatitudeLongitude(34.11348, -118.26557),  # P - LA River & Glendale Blvd
+        fmap.MapLatitudeLongitude(34.12154, -118.27044),  # Q - LA River & Los Feliz Blvd
+        fmap.MapLatitudeLongitude(34.14096, -118.27679),  # R - LA River and Colorado St
+        fmap.MapLatitudeLongitude(34.15291, -118.27945),  # A — close polygon back to NW corner
+    ]
+
+    boundary_polygon_layer = fmap.PolygonLayer(
+        polygons=[
+            fmap.PolygonMarker(
+                coordinates=BOUNDARY_POINTS,
+                color="#1A00C8AA",
+                border_color=TEAL,
+                border_stroke_width=2.5,
+            )
+        ]
+    )
+
+    # Build layers with empty lists initially.
+    # refresh_map() replaces contents as WebSocket updates arrive.
+    # restaurant_layer is also rebuilt by refresh_map() so colors update live.
+    restaurant_layer = fmap.MarkerLayer(markers=[])
+    polyline_layer   = fmap.PolylineLayer(polylines=[])
+    residence_layer  = fmap.MarkerLayer(markers=[])   # active delivery destinations
+    marker_layer     = fmap.MarkerLayer(markers=[])
+
+    # The Map control: OSM tiles → boundary → restaurants → routes →
+    #                  residence destinations → robots (topmost).
+    map_control = fmap.Map(
+        expand=True,
+        initial_center=fmap.MapLatitudeLongitude(GLENDALE_LAT, GLENDALE_LON),
+        initial_zoom=13,
+        min_zoom=11,
+        max_zoom=18,
+        layers=[
+            fmap.TileLayer(
+                url_template="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+                additional_options={
+                    "attribution": "© OpenStreetMap contributors",
+                },
+            ),
+            boundary_polygon_layer,   # simulation boundary fill + outline
+            restaurant_layer,         # restaurant locations (clickable)
+            polyline_layer,           # active robot routes
+            residence_layer,          # active delivery destinations (above routes)
+            marker_layer,             # robot position dots (topmost)
+        ],
+    )
+
+    robot_count  = ft.Text("Waiting for simulation…", color=TEXT_DIM, size=12)
+    last_updated = ft.Text("", color=TEXT_DIM, size=11, italic=True)
+
+    def refresh_map():
+        """Rebuild markers and route polylines from state.robots and redraw."""
+        valid = [r for r in state.robots
+                 if r.get("lat") is not None and r.get("lon") is not None]
+
+        # Restaurant markers — rebuilt each call so busy colors stay in sync
+        restaurant_layer.markers = [
+            restaurant_marker(r) for r in state.restaurants
+        ]
+
+        # Robot markers — one per robot, color by status
+        marker_layer.markers = [robot_marker(r) for r in valid]
+
+        # Residence markers — one per robot currently on leg 2 (to_residence)
+        residence_layer.markers = [
+            residence_marker(r) for r in state.active_residences
+            if r.get("residence_lat") is not None
+        ]
+
+        # Polylines — one per robot that has an active route
+        lines = []
+        for r in valid:
+            coords    = r.get("route_coords")
+            leg_type  = r.get("leg_type")
+            if not coords or not leg_type:
+                continue
+            color = ROUTE_COLORS.get(leg_type, TEAL)
+            lines.append(
+                fmap.PolylineMarker(
+                    coordinates=[
+                        fmap.MapLatitudeLongitude(lat, lon)
+                        for lat, lon in coords
+                    ],
+                    color=color,
+                    stroke_width=3.0,
+                )
+            )
+        polyline_layer.polylines = lines
+
+        n = len(marker_layer.markers)
+        robot_count.value  = f"{n} robot{'s' if n != 1 else ''} active"
+        last_updated.value = f"Updated {datetime.datetime.now().strftime('%H:%M:%S')}"
+        page.update()
+
+    # Chain after the robot-table hook so both views stay in sync
+    _prev = state.on_robot_update
+
+    def _chained():
+        if _prev:
+            _prev()
+        refresh_map()
+
+    state.on_robot_update = _chained
+
+    def legend_dot(color: str, label: str) -> ft.Row:
+        return ft.Row(spacing=6, controls=[
+            ft.Container(width=12, height=12, bgcolor=color, border_radius=6),
+            ft.Text(label, color=TEXT_DIM, size=11),
+        ])
+
+    def legend_line(color: str, label: str) -> ft.Row:
+        return ft.Row(spacing=6, controls=[
+            ft.Container(width=20, height=3, bgcolor=color, border_radius=2),
+            ft.Text(label, color=TEXT_DIM, size=11),
+        ])
 
     # --- Form fields --------------------------------------------------------
 
     config_name = ft.TextField(
         label="Config name",
-        value="rush_hour",
+        value="default",
         hint_text="Name of the delivery config (e.g. rush_hour)",
         color=TEXT_MAIN,
         bgcolor=BG_SURFACE,
@@ -248,66 +626,20 @@ def build_controls_view(state: AppState, page: ft.Page) -> ft.Column:
     start_btn.on_click = start_simulation
     stop_btn.on_click = stop_simulation
 
-    # Load past sims once when the view is built (non-blocking)
+    def load_restaurants():
+        """Fetch all restaurants from the API once and populate the map layer."""
+        try:
+            resp = httpx.get(f"{API_BASE}/api/v1/restaurants", timeout=10)
+            state.restaurants = resp.json().get("restaurants", [])
+            refresh_map()
+        except Exception as ex:
+            logger.warning(f"Could not load restaurants: {ex}")
+
+    # Load past sims and restaurant pins once when the view is built (non-blocking)
     threading.Thread(target=load_past_simulations, daemon=True).start()
-
-    # --- Layout --------------------------------------------------------------
-
-    return ft.Column(
-        scroll=ft.ScrollMode.AUTO,
-        spacing=20,
-        controls=[
-            ft.Text("Simulation Controls", size=22, weight=ft.FontWeight.BOLD,
-                    color=TEAL),
-            ft.Divider(color=BG_SURFACE),
-
-            # Config form
-            ft.Container(
-                padding=20,
-                bgcolor=BG_CARD,
-                border_radius=10,
-                content=ft.Column(spacing=14, controls=[
-                    ft.Text("Run Parameters", size=15, color=TEXT_MAIN,
-                            weight=ft.FontWeight.W_600),
-                    config_name,
-                    num_robots,
-                    duration_hours,
-                    ft.Divider(color=BG_SURFACE),
-                    real_time_switch,
-                    speed_factor,
-                    ft.Row([start_btn, stop_btn], spacing=12),
-                    status_text,
-                ]),
-            ),
-
-            # Past simulations panel
-            ft.Container(
-                padding=20,
-                bgcolor=BG_CARD,
-                border_radius=10,
-                content=ft.Column(spacing=8, controls=[
-                    ft.Text("Past Simulation Runs", size=15, color=TEXT_MAIN,
-                            weight=ft.FontWeight.W_600),
-                    past_sims_list,
-                ]),
-            ),
-        ],
-    )
-
-
-# ===========================================================================
-# VIEW 2 — Dashboard / Stats
-# ===========================================================================
-
-def build_dashboard_view(state: AppState, page: ft.Page) -> ft.Column:
-    """
-    Summary cards showing live delivery counts + final results.
-
-    REST polling:  GET /api/v1/stats  (every 5 s while running)
-                   GET /api/v1/simulations/{id}/results  (once, after run)
-    """
-
-    def stat_card(label: str, ref: ft.Ref) -> ft.Container:
+    threading.Thread(target=load_restaurants,      daemon=True).start()
+    
+    def stat_card(label: str, ref: ft.Ref, value_color: str = TEAL) -> ft.Container:
         return ft.Container(
             width=180, height=110,
             bgcolor=BG_CARD,
@@ -318,7 +650,7 @@ def build_dashboard_view(state: AppState, page: ft.Page) -> ft.Column:
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                 controls=[
                     ft.Text(ref=ref, value="—", size=32,
-                            weight=ft.FontWeight.BOLD, color=TEAL),
+                            weight=ft.FontWeight.BOLD, color=value_color),
                     ft.Text(label, size=12, color=TEXT_DIM),
                 ],
             ),
@@ -327,6 +659,7 @@ def build_dashboard_view(state: AppState, page: ft.Page) -> ft.Column:
     total_ref     = ft.Ref[ft.Text]()
     completed_ref = ft.Ref[ft.Text]()
     pending_ref   = ft.Ref[ft.Text]()
+    rejected_ref  = ft.Ref[ft.Text]()
     robots_a_ref  = ft.Ref[ft.Text]()
     robots_i_ref  = ft.Ref[ft.Text]()
     avg_time_ref  = ft.Ref[ft.Text]()
@@ -341,6 +674,7 @@ def build_dashboard_view(state: AppState, page: ft.Page) -> ft.Column:
             total_ref.current.value     = str(s.get("total_deliveries", "—"))
             completed_ref.current.value = str(s.get("completed_deliveries", "—"))
             pending_ref.current.value   = str(s.get("pending_deliveries", "—"))
+            rejected_ref.current.value  = str(s.get("rejected_deliveries", "—"))
             robots_a_ref.current.value  = str(s.get("robots_active", "—"))
             robots_i_ref.current.value  = str(s.get("robots_idle", "—"))
             avg_s = s.get("average_delivery_time", None)
@@ -366,39 +700,150 @@ def build_dashboard_view(state: AppState, page: ft.Page) -> ft.Column:
 
     threading.Thread(target=poll_loop, daemon=True).start()
 
+    # --- Layout --------------------------------------------------------------
+
     return ft.Column(
         scroll=ft.ScrollMode.AUTO,
         spacing=20,
+        expand=True,
         controls=[
-            ft.Text("Dashboard", size=22, weight=ft.FontWeight.BOLD, color=TEAL),
+            ft.Text("Live Map", size=22, weight=ft.FontWeight.BOLD, color=TEAL),
             ft.Divider(color=BG_SURFACE),
-            last_updated,
+            ft.Row([robot_count, last_updated], spacing=16),
 
-            # Delivery counters
-            ft.Text("Deliveries", size=15, color=TEXT_MAIN,
-                    weight=ft.FontWeight.W_600),
-            ft.Row(spacing=12, wrap=True, controls=[
-                stat_card("Total",     total_ref),
-                stat_card("Completed", completed_ref),
-                stat_card("Pending",   pending_ref),
-            ]),
+            # Map fills available height; Container gives it a fixed height
+            # so the rest of the column layout is stable.
+            ft.Container(
+                height=520,
+                border_radius=10,
+                clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+                content=map_control,
+            ),
 
-            # Robot counters
-            ft.Text("Robots", size=15, color=TEXT_MAIN,
-                    weight=ft.FontWeight.W_600),
-            ft.Row(spacing=12, wrap=True, controls=[
-                stat_card("Active", robots_a_ref),
-                stat_card("Idle",   robots_i_ref),
-            ]),
+            # Status legend
+            ft.Container(
+                padding=ft.Padding(left=12, right=12, top=8, bottom=8),
+                bgcolor=BG_CARD,
+                border_radius=8,
+                content=ft.Column(spacing=8, controls=[
+                    ft.Row(spacing=24, controls=[
+                        legend_dot(TEAL,     "Traveling"),
+                        legend_dot(ORANGE,   "At restaurant"),
+                        legend_dot(GREEN,    "At residence"),
+                        legend_dot(TEXT_DIM, "Idle"),
+                    ]),
+                    ft.Row(spacing=24, controls=[
+                        legend_line(ORANGE, "Route → restaurant"),
+                        legend_line(GREEN,  "Route → residence"),
+                        legend_line(TEAL,   "Simulation boundary"),
+                    ]),
+                    ft.Row(spacing=24, controls=[
+                        ft.Row(spacing=6, controls=[
+                            ft.Container(width=12, height=12,
+                                         bgcolor="#7F8C8D", border_radius=2),
+                            ft.Text("Restaurant", color=TEXT_DIM, size=11),
+                        ]),
+                        ft.Row(spacing=6, controls=[
+                            ft.Container(width=12, height=12,
+                                         bgcolor=ORANGE, border_radius=2),
+                            ft.Text("Restaurant (order pending)", color=TEXT_DIM, size=11),
+                        ]),
+                    ]),
+                ]),
+            ),
+            ft.Row(
+                controls=[
+                    ft.Text("Simulation Controls", size=22, weight=ft.FontWeight.BOLD,
+                            color=TEAL),
+                    ft.Divider(color=BG_SURFACE),
 
-            # Performance
-            ft.Text("Performance", size=15, color=TEXT_MAIN,
-                    weight=ft.FontWeight.W_600),
-            ft.Row(spacing=12, controls=[
-                stat_card("Avg Delivery Time", avg_time_ref),
-            ]),
+                    # Config form
+                    ft.Container(
+                        padding=20,
+                        bgcolor=BG_CARD,
+                        border_radius=10,
+                        content=ft.Column(
+                            spacing=14,
+                            controls=[
+                                ft.Text("Run Parameters", size=15, color=TEXT_MAIN,
+                                        weight=ft.FontWeight.W_600),
+                                config_name,
+                                num_robots,
+                                duration_hours,
+                                ft.Divider(color=BG_SURFACE),
+                                real_time_switch,
+                                speed_factor,
+                                ft.Row([start_btn, stop_btn], spacing=12),
+                                status_text,
+                            ],
+                        ),
+                    ),
+#                    # Past simulations panel
+#                    ft.Container(
+#                        padding=20,
+#                        bgcolor=BG_CARD,
+#                        border_radius=10,
+#                        content=ft.Column(spacing=8, controls=[
+#                            ft.Text("Past Simulation Runs", size=15, color=TEXT_MAIN,
+#                                    weight=ft.FontWeight.W_600),
+#                            past_sims_list,
+#                        ]),
+#                    ),
+                    ft.Container(
+                        content=ft.Column(
+                            controls=[
+                                ft.Text("Dashboard", size=22, weight=ft.FontWeight.BOLD, color=TEAL),
+                                ft.Divider(color=BG_SURFACE),
+                                last_updated,
+
+                                # Delivery counters
+                                ft.Text("Deliveries", size=15, color=TEXT_MAIN,
+                                        weight=ft.FontWeight.W_600),
+                                ft.Row(spacing=12, wrap=True, controls=[
+                                    stat_card("Total",     total_ref),
+                                    stat_card("Completed", completed_ref),
+                                    stat_card("Pending",   pending_ref),
+                                    stat_card("Rejected",  rejected_ref,
+                                              value_color=RED),
+                                ]),
+
+                                # Robot counters
+                                ft.Text("Robots", size=15, color=TEXT_MAIN,
+                                        weight=ft.FontWeight.W_600),
+                                ft.Row(spacing=12, wrap=True, controls=[
+                                    stat_card("Active", robots_a_ref),
+                                    stat_card("Idle",   robots_i_ref),
+                                ]),
+
+                                # Performance
+                                ft.Text("Performance", size=15, color=TEXT_MAIN,
+                                        weight=ft.FontWeight.W_600),
+                                ft.Row(
+                                    spacing=12,
+                                    controls=[
+                                        stat_card("Avg Delivery Time", avg_time_ref),
+                                    ]
+                                ),
+                            ],
+                        ),
+                    ),
+                ],
+            ),
         ],
     )
+
+# ===========================================================================
+# VIEW 2 — Analysis Board
+# ===========================================================================
+
+def build_analysis_view(state: AppState, page: ft.Page) -> ft.Column:
+    """
+
+    """
+    return ft.Column()
+# ===========================================================================
+# VIEW 2 Old — Dashboard / Stats
+# ===========================================================================
 
 
 # ===========================================================================
@@ -519,7 +964,7 @@ def build_delivery_log_view(state: AppState, page: ft.Page) -> ft.Column:
     def delivery_row(d: dict) -> ft.Container:
         status = d.get("status", "pending")
         icon, colour = STATUS_ICONS.get(status, ("?", TEXT_DIM))
-        dur = d.get("duration_s")
+        dur = d.get("duration_seconds")
         dur_str = f"{int(dur//60)}m {int(dur%60)}s" if dur else "—"
         dist_str = f"{d.get('distance_km', 0):.2f} km"
 
@@ -599,202 +1044,6 @@ def build_delivery_log_view(state: AppState, page: ft.Page) -> ft.Column:
         ],
     )
 
-
-# ===========================================================================
-# VIEW 5 — Live Map
-# ===========================================================================
-
-def build_map_view(state: AppState, page: ft.Page) -> ft.Column:
-    """
-    Interactive map of Glendale showing live robot positions as markers,
-    built with flet-map on top of OpenStreetMap tiles.
-
-    How it works
-    ------------
-    flet-map wraps Flutter's flutter_map package. The Map control contains:
-      - TileLayer  → fetches OSM raster tiles from the internet at render time;
-                     the browser requests only the tiles visible at the current
-                     zoom level (no tiles are stored locally).
-      - MarkerLayer → a list of Marker objects, each pinned to a lat/lon.
-                     We rebuild this list every time the robot WebSocket pushes
-                     a position update.
-
-    The marker_layer reference is kept so refresh_map() can swap in a new
-    markers list and call page.update() to redraw.
-    """
-
-    # Glendale city centre — where the map opens by default
-    GLENDALE_LAT = 34.1425
-    GLENDALE_LON = -118.2551
-
-    STATUS_COLORS = {
-        "traveling":     TEAL,
-        "at_restaurant": ORANGE,
-        "at_residence":  GREEN,
-        "idle":          TEXT_DIM,
-    }
-
-    def robot_marker(r: dict) -> fmap.Marker:
-        """Build a flet-map Marker for one robot dict from the WebSocket."""
-        lat    = r.get("lat", GLENDALE_LAT)
-        lon    = r.get("lon", GLENDALE_LON)
-        status = r.get("status", "idle")
-        rid    = r.get("robot_id", "?")
-        color  = STATUS_COLORS.get(status, TEXT_MAIN)
-
-        return fmap.Marker(
-            # Geographic position of this marker
-            coordinates=fmap.MapLatitudeLongitude(lat, lon),
-            # The visual widget rendered at that position.
-            # A Stack lets us layer a label on top of the dot.
-            content=ft.Stack(
-                width=36, height=36,
-                controls=[
-                    ft.Container(
-                        width=20, height=20,
-                        bgcolor=color,
-                        border_radius=10,
-                        border=ft.Border.all(2, "#FFFFFF"),
-                        margin=ft.Margin(left=8, top=8, right=0, bottom=0),
-                        tooltip=f"Robot #{rid} — {status}",
-                    ),
-                    ft.Text(
-                        f"#{rid}",
-                        size=9,
-                        color="#FFFFFF",
-                        weight=ft.FontWeight.BOLD,
-                        left=11, top=11,
-                    ),
-                ],
-            ),
-        )
-
-    # Route color by leg type — matches the marker status colors
-    ROUTE_COLORS = {
-        "to_restaurant": ORANGE,
-        "to_residence":  GREEN,
-    }
-
-    # Build layers with empty lists initially.
-    # refresh_map() replaces contents as WebSocket updates arrive.
-    polyline_layer = fmap.PolylineLayer(polylines=[])
-    marker_layer   = fmap.MarkerLayer(markers=[])
-
-    # The Map control: OSM tiles → route polylines → robot markers (order matters).
-    map_control = fmap.Map(
-        expand=True,
-        initial_center=fmap.MapLatitudeLongitude(GLENDALE_LAT, GLENDALE_LON),
-        initial_zoom=13,
-        min_zoom=11,
-        max_zoom=18,
-        layers=[
-            fmap.TileLayer(
-                url_template="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-                additional_options={
-                    "attribution": "© OpenStreetMap contributors",
-                },
-            ),
-            polyline_layer,   # drawn below markers so dots sit on top of lines
-            marker_layer,
-        ],
-    )
-
-    robot_count  = ft.Text("Waiting for simulation…", color=TEXT_DIM, size=12)
-    last_updated = ft.Text("", color=TEXT_DIM, size=11, italic=True)
-
-    def refresh_map():
-        """Rebuild markers and route polylines from state.robots and redraw."""
-        valid = [r for r in state.robots
-                 if r.get("lat") is not None and r.get("lon") is not None]
-
-        # Markers — one per robot, color by status
-        marker_layer.markers = [robot_marker(r) for r in valid]
-
-        # Polylines — one per robot that has an active route
-        lines = []
-        for r in valid:
-            coords    = r.get("route_coords")
-            leg_type  = r.get("leg_type")
-            if not coords or not leg_type:
-                continue
-            color = ROUTE_COLORS.get(leg_type, TEAL)
-            lines.append(
-                fmap.Polyline(
-                    points=[
-                        fmap.MapLatitudeLongitude(lat, lon)
-                        for lat, lon in coords
-                    ],
-                    color=color,
-                    stroke_width=3.0,
-                )
-            )
-        polyline_layer.polylines = lines
-
-        n = len(marker_layer.markers)
-        robot_count.value  = f"{n} robot{'s' if n != 1 else ''} active"
-        last_updated.value = f"Updated {datetime.datetime.now().strftime('%H:%M:%S')}"
-        page.update()
-
-    # Chain after the robot-table hook so both views stay in sync
-    _prev = state.on_robot_update
-
-    def _chained():
-        if _prev:
-            _prev()
-        refresh_map()
-
-    state.on_robot_update = _chained
-
-    def legend_dot(color: str, label: str) -> ft.Row:
-        return ft.Row(spacing=6, controls=[
-            ft.Container(width=12, height=12, bgcolor=color, border_radius=6),
-            ft.Text(label, color=TEXT_DIM, size=11),
-        ])
-
-    def legend_line(color: str, label: str) -> ft.Row:
-        return ft.Row(spacing=6, controls=[
-            ft.Container(width=20, height=3, bgcolor=color, border_radius=2),
-            ft.Text(label, color=TEXT_DIM, size=11),
-        ])
-
-    return ft.Column(
-        spacing=12,
-        controls=[
-            ft.Text("Live Map", size=22, weight=ft.FontWeight.BOLD, color=TEAL),
-            ft.Divider(color=BG_SURFACE),
-            ft.Row([robot_count, last_updated], spacing=16),
-
-            # Map fills available height; Container gives it a fixed height
-            # so the rest of the column layout is stable.
-            ft.Container(
-                height=520,
-                border_radius=10,
-                clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-                content=map_control,
-            ),
-
-            # Status legend
-            ft.Container(
-                padding=ft.Padding(left=12, right=12, top=8, bottom=8),
-                bgcolor=BG_CARD,
-                border_radius=8,
-                content=ft.Column(spacing=8, controls=[
-                    ft.Row(spacing=24, controls=[
-                        legend_dot(TEAL,     "Traveling"),
-                        legend_dot(ORANGE,   "At restaurant"),
-                        legend_dot(GREEN,    "At residence"),
-                        legend_dot(TEXT_DIM, "Idle"),
-                    ]),
-                    ft.Row(spacing=24, controls=[
-                        legend_line(ORANGE, "Route → restaurant"),
-                        legend_line(GREEN,  "Route → residence"),
-                    ]),
-                ]),
-            ),
-        ],
-    )
-
-
 # ===========================================================================
 # WebSocket helpers — run in background daemon threads
 # ===========================================================================
@@ -815,6 +1064,12 @@ def _start_ws_threads(state: AppState, page: ft.Page):
                         msg = json.loads(raw)
                         if msg.get("type") == "robot_update":
                             state.robots = msg.get("robots", [])
+                            # Build a fast lookup dict: restaurant_id → pending count
+                            state.busy_restaurants = {
+                                r["restaurant_id"]: r["pending_count"]
+                                for r in msg.get("busy_restaurants", [])
+                            }
+                            state.active_residences = msg.get("active_residences", [])
                             if state.on_robot_update:
                                 state.on_robot_update()
             except Exception:
@@ -863,23 +1118,20 @@ def main(page: ft.Page):
     # map view is built last so its on_robot_update hook chains correctly after
     # the robot-table hook (which is registered by build_robot_table_view).
     views = {
-        "controls":  build_controls_view(state, page),
-        "dashboard": build_dashboard_view(state, page),
-        "robots":    build_robot_table_view(state, page),
-        "log":       build_delivery_log_view(state, page),
-        "map":       build_map_view(state, page),
+        "sim":  build_sim_view(state, page),
+        "analysis": build_analysis_view(state, page),
     }
 
     # Content area — swapped out when nav changes
     content_area = ft.Container(
         expand=True,
         padding=24,
-        content=views["controls"],
+        content=views["sim"],
     )
 
     def nav_changed(e):
         idx = e.control.selected_index
-        key = ["controls", "dashboard", "robots", "log", "map"][idx]
+        key = ["sim", "analysis"][idx]
         content_area.content = views[key]
         page.update()
 
@@ -891,29 +1143,14 @@ def main(page: ft.Page):
         indicator_shape=ft.RoundedRectangleBorder(radius=8),
         destinations=[
             ft.NavigationRailDestination(
-                icon=ft.Icons.SETTINGS_OUTLINED,
-                selected_icon=ft.Icons.SETTINGS,
-                label="Controls",
+                icon=ft.Icons.PLAY_ARROW_OUTLINED,
+                selected_icon=ft.Icons.PLAY_ARROW,
+                label="Simulation",
             ),
             ft.NavigationRailDestination(
-                icon=ft.Icons.DASHBOARD_OUTLINED,
-                selected_icon=ft.Icons.DASHBOARD,
-                label="Dashboard",
-            ),
-            ft.NavigationRailDestination(
-                icon=ft.Icons.PRECISION_MANUFACTURING_OUTLINED,
-                selected_icon=ft.Icons.PRECISION_MANUFACTURING,
-                label="Robots",
-            ),
-            ft.NavigationRailDestination(
-                icon=ft.Icons.LIST_ALT_OUTLINED,
-                selected_icon=ft.Icons.LIST_ALT,
-                label="Log",
-            ),
-            ft.NavigationRailDestination(
-                icon=ft.Icons.MAP_OUTLINED,
-                selected_icon=ft.Icons.MAP,
-                label="Map",
+                icon=ft.Icons.BAR_CHART_OUTLINED,
+                selected_icon=ft.Icons.BAR_CHART,
+                label="Analysis",
             ),
         ],
         on_change=nav_changed,
