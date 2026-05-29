@@ -36,6 +36,9 @@ secrets/
 # Docker
 .dockerignore
 
+# osmnx cache (raw Overpass API responses, re-downloaded automatically)
+app/cache/
+
 # Database / data files
 *.db
 *.sqlite
