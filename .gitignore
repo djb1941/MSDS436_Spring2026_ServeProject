@@ -51,6 +51,7 @@ data/
 # Logs
 *.log
 logs/
+debug_logs/
 
 # OS artifacts
 .DS_Store

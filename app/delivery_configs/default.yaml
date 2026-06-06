@@ -17,3 +17,33 @@ constraints:
   max_delivery_time_minutes: 30  # reject orders whose estimated delivery time exceeds this
   robot_speed_kmh: 6.0           # sidewalk robot cruising speed (~3.7 mph)
   pickup_minutes: 1.0            # time at restaurant to collect the order
+
+# --- Idle robot behavior ---------------------------------------------------
+# strategy options:
+#   "stay"             — robots hold position after delivery (current default)
+#   "post_restaurant"  — robots reposition to the nearest restaurant that has
+#                        no other robot already posted there
+#   "post_location"    — robots reposition to the nearest user-defined stand
+#                        (taxi-stand style) defined in post_locations below
+idle_behavior:
+  strategy: "stay"
+
+  # post_locations is only used when strategy = "post_location".
+  # Define as many named lat/lon points as you like (within the simulation
+  # boundary).  The dispatcher picks the closest unoccupied stand each time.
+  post_locations:
+    - name: "Brand Blvd & Broadway"
+      lat: 34.1509
+      lon: -118.2572
+    - name: "Central Ave & California St"
+      lat: 34.1478
+      lon: -118.2488
+    - name: "Colorado St & Louise St"
+      lat: 34.1456
+      lon: -118.2545
+    - name: "Glendale Galleria Area"
+      lat: 34.1494
+      lon: -118.2601
+    - name: "San Fernando Rd & Wilson Ave"
+      lat: 34.1391
+      lon: -118.2536

@@ -37,6 +37,7 @@ import sys
 
 import networkx as nx
 import osmnx as ox
+import polars as pl
 import psycopg2
 from psycopg2.extras import execute_values
 from shapely.geometry import Polygon as ShapelyPolygon
@@ -194,6 +195,49 @@ def setup_road_network():
 
 
 # ---------------------------------------------------------------------------
+# GeoDataFrame → Polars conversion
+# ---------------------------------------------------------------------------
+
+# Tag columns we want to carry over from OSM into our address builder.
+# osmnx returns GeoDataFrames with one column per unique OSM tag; not every
+# column is present in every result set, so we handle missing ones gracefully.
+_OSM_TAG_COLS = ["name", "addr:housenumber", "addr:street", "addr:city"]
+
+
+def _gdf_to_polars(gdf) -> pl.DataFrame:
+    """
+    Convert a GeoDataFrame (with centroids already computed) to a Polars
+    DataFrame containing only the columns we need.
+
+    Why this exists
+    ---------------
+    osmnx returns GeoPandas GeoDataFrames — we need GeoPandas for the
+    geometry operations (.notna(), .centroid, .x, .y) because those are
+    Shapely/GEOS operations with no Polars equivalent.  Once we have the
+    coordinates and tag strings we want, we hand off to Polars for all
+    subsequent application-level processing (filtering, slicing, iteration).
+
+    NaN handling
+    ------------
+    pandas .tolist() on a column with missing values produces Python float
+    nan, not None.  We normalise to None via .where(..., other=None) so
+    Polars stores proper nulls and _osm_str receives None rather than nan.
+    """
+    data: dict = {
+        "x": gdf.geometry.x.tolist(),
+        "y": gdf.geometry.y.tolist(),
+    }
+    for col in _OSM_TAG_COLS:
+        if col in gdf.columns:
+            # Replace pandas NaN with Python None before handing to Polars
+            data[col] = gdf[col].where(gdf[col].notna(), other=None).tolist()
+        else:
+            data[col] = [None] * len(gdf)
+
+    return pl.DataFrame(data, strict=False)
+
+
+# ---------------------------------------------------------------------------
 # Step 2 — Restaurants
 # ---------------------------------------------------------------------------
 
@@ -212,23 +256,21 @@ def setup_restaurants(conn):
         tags={"amenity": "restaurant"},
     )
 
-    # We only want Point geometries (some OSM entries are outlines of
-    # the building instead of a single point). Convert everything to
-    # a centroid so all rows are proper Points.
+    # Convert every geometry to its centroid Point (handles both Point and
+    # Polygon/footprint OSM entries uniformly) then drop any null geometries.
     gdf = gdf[gdf.geometry.notna()].copy()
     gdf["geometry"] = gdf["geometry"].centroid
 
-    # Cap results
-    gdf = gdf.head(MAX_RESTAURANTS)
+    # Hand off to Polars for all application-level processing from here on.
+    df = _gdf_to_polars(gdf).head(MAX_RESTAURANTS)
 
-    log.info("Found %d restaurants. Inserting into PostGIS …", len(gdf))
+    log.info("Found %d restaurants. Inserting into PostGIS …", len(df))
 
     rows = []
-    for _, row in gdf.iterrows():
-        name    = str(row.get("name", "Unknown Restaurant"))[:255]
+    for row in df.iter_rows(named=True):
+        name    = _osm_str(row.get("name"), "Unknown Restaurant")[:255]
         address = _build_address(row)
-        # ST_GeomFromText expects WKT with SRID
-        wkt = f"SRID=4326;POINT({row.geometry.x} {row.geometry.y})"
+        wkt     = f"SRID=4326;POINT({row['x']} {row['y']})"
         rows.append((name, address, wkt))
 
     with conn.cursor() as cur:
@@ -268,14 +310,15 @@ def setup_residences(conn):
     # Convert to centroid Points so they fit the GEOMETRY(Point, 4326) column.
     gdf["geometry"] = gdf["geometry"].centroid
 
-    gdf = gdf.head(MAX_RESIDENCES)
+    # Hand off to Polars for all application-level processing from here on.
+    df = _gdf_to_polars(gdf).head(MAX_RESIDENCES)
 
-    log.info("Found %d residences. Inserting into PostGIS …", len(gdf))
+    log.info("Found %d residences. Inserting into PostGIS …", len(df))
 
     rows = []
-    for _, row in gdf.iterrows():
+    for row in df.iter_rows(named=True):
         address = _build_address(row)
-        wkt = f"SRID=4326;POINT({row.geometry.x} {row.geometry.y})"
+        wkt     = f"SRID=4326;POINT({row['x']} {row['y']})"
         rows.append((address, wkt))
 
     with conn.cursor() as cur:
@@ -296,24 +339,40 @@ def setup_residences(conn):
 # Address helper
 # ---------------------------------------------------------------------------
 
+def _osm_str(val, default: str = "") -> str:
+    """
+    Safely coerce an OSM tag value to a clean string.
+
+    OSM tag columns that are absent for a given feature arrive as Python
+    None (after our GeoDataFrame → Polars conversion normalises pandas NaN
+    to None).  This helper converts the value to str, strips whitespace,
+    and returns `default` for any empty, None, or residual "nan" / "none"
+    result, ensuring no garbage strings end up in the DB.
+    """
+    if val is None:
+        return default
+    s = str(val).strip()
+    return default if s.lower() in ("nan", "none", "") else s
+
+
 def _build_address(row) -> str:
     """
     Build a best-effort address string from OSM tags.
     OSM address fields are inconsistently populated, so we fall back
     gracefully through the available tags.
     """
-    parts = []
-    housenumber = row.get("addr:housenumber", "")
-    street      = row.get("addr:street", "")
-    city        = row.get("addr:city", "Glendale")
+    housenumber = _osm_str(row.get("addr:housenumber"))
+    street      = _osm_str(row.get("addr:street"))
+    city        = _osm_str(row.get("addr:city"), "Glendale")
 
+    parts = []
     if housenumber and street:
         parts.append(f"{housenumber} {street}")
     elif street:
         parts.append(street)
 
     if city:
-        parts.append(str(city))
+        parts.append(city)
 
     return ", ".join(parts)[:255] if parts else "Glendale, CA"
 
@@ -372,8 +431,57 @@ def apply_migrations(conn):
                 reason          VARCHAR(50) NOT NULL
             )
         """)
+        # idle_strategy column — added when dispatcher idle behavior was introduced
+        cur.execute("""
+            ALTER TABLE robotics.simulations
+            ADD COLUMN IF NOT EXISTS idle_strategy VARCHAR(50) DEFAULT 'stay'
+        """)
+        # Clean up "nan …" addresses written by the old _build_address bug.
+        # Any address containing the literal word "nan" was produced by the
+        # pandas NaN-to-string coercion issue and should fall back to the
+        # generic city placeholder.
+        cur.execute("""
+            UPDATE robotics.restaurants
+            SET address = 'Glendale, CA'
+            WHERE address ILIKE '%nan%'
+        """)
+        cur.execute("""
+            UPDATE robotics.residences
+            SET address = 'Glendale, CA'
+            WHERE address ILIKE '%nan%'
+        """)
     conn.commit()
     log.info("Schema migrations applied.")
+
+
+def reset_analytics_if_fresh_db(conn):
+    """
+    Keep the DuckDB analytics store in sync with the Postgres lifecycle.
+
+    Postgres (persistent volume) and the DuckDB analytics file (separate
+    persistent volume, ./data) can drift apart: if the Postgres volume is
+    wiped, its SERIAL ids restart from 1 while DuckDB still holds rows from
+    the previous database incarnation. The old rows then collide with the
+    restarted ids on export ("Duplicate key … violates primary key").
+
+    A wiped/fresh Postgres has no simulations yet, so an empty simulations
+    table is our signal to drop the stale analytics store and let it rebuild.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM robotics.simulations")
+        sim_count = cur.fetchone()[0]
+
+    if sim_count > 0:
+        log.info("Postgres has %d existing simulation(s) — analytics store kept.", sim_count)
+        return
+
+    try:
+        sys.path.insert(0, "/app")
+        import analytics
+        analytics.reset_store()
+        log.info("Fresh Postgres detected (0 simulations) — analytics store reset.")
+    except Exception as exc:  # non-fatal: analytics simply rebuilds on next export
+        log.warning("Could not reset analytics store (non-fatal): %s", exc)
 
 
 def main():
@@ -389,6 +497,7 @@ def main():
     conn = get_db_connection()
     try:
         apply_migrations(conn)
+        reset_analytics_if_fresh_db(conn)
         setup_restaurants(conn)
         setup_residences(conn)
     finally:

@@ -48,7 +48,8 @@ CREATE TABLE robotics.simulations (
     status VARCHAR(50) DEFAULT 'pending', -- 'pending', 'running', 'completed', 'failed', 'stopped'
     real_time BOOLEAN DEFAULT FALSE,      -- FALSE = run as fast as possible
     speed_factor FLOAT DEFAULT 1.0,       -- sim minutes per wall-clock second (real_time only)
-    current_sim_time_s FLOAT DEFAULT 0    -- sim engine writes this every ~1 sim-min for WS interpolation
+    current_sim_time_s FLOAT DEFAULT 0,   -- sim engine writes this every ~1 sim-min for WS interpolation
+    idle_strategy VARCHAR(50) DEFAULT 'stay'  -- 'stay' | 'post_restaurant' | 'post_location'
 );
 
 -- Deliveries table

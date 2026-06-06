@@ -27,6 +27,7 @@ from db_writer import SimulationDatabaseWriter
 from dispatcher import Dispatcher
 from delivery_generator import DeliveryGenerator
 from robot_agent import RobotAgent
+import analytics
 
 load_dotenv()
 
@@ -66,7 +67,7 @@ def claim_pending_simulation(db_url: str) -> dict | None:
                     LIMIT 1
                     FOR UPDATE SKIP LOCKED
                 )
-                RETURNING id, config_name, num_robots, duration_hours, real_time, speed_factor
+                RETURNING id, config_name, num_robots, duration_hours, real_time, speed_factor, idle_strategy
                 """
             )
             row = cur.fetchone()
@@ -79,6 +80,7 @@ def claim_pending_simulation(db_url: str) -> dict | None:
                 "duration_hours": row[3],
                 "real_time":      row[4],
                 "speed_factor":   row[5],
+                "idle_strategy":  row[6] or "stay",
             }
         return None
     finally:
@@ -110,6 +112,7 @@ def run_simulation(
     duration_hours: float,
     real_time: bool = False,
     speed_factor: float = 1.0,
+    idle_strategy: str = "stay",
 ):
     """Execute one simulation run using an already-claimed sim_id."""
 
@@ -129,9 +132,14 @@ def run_simulation(
         config.get("constraints", {}).get("robot_speed_kmh", 6.0)
     )
 
+    # The idle_strategy passed in overrides the config file's setting.
+    # This lets the UI select a strategy without creating a new YAML per variant.
+    effective_strategy = idle_strategy or config.get("idle_behavior", {}).get("strategy", "stay")
+    post_locations_cfg = config.get("idle_behavior", {}).get("post_locations", [])
+
     logger.info(
-        "Simulation %d: config='%s', %d robots, %.0fh, robot speed=%.1f km/h",
-        sim_id, config_name, num_robots, duration_hours, robot_speed_kmh,
+        "Simulation %d: config='%s', %d robots, %.0fh, robot speed=%.1f km/h, idle='%s'",
+        sim_id, config_name, num_robots, duration_hours, robot_speed_kmh, effective_strategy,
     )
 
     # Load road network (cached on disk after first run)
@@ -157,7 +165,47 @@ def run_simulation(
         env = simpy.Environment()
         logger.info("Fast mode: running as fast as possible")
 
-    dispatcher = Dispatcher()
+    # Load restaurants from DB so the dispatcher can use them for post_restaurant
+    # strategy.  We import DeliveryGenerator's private helper via a one-off load.
+    post_restaurants = []
+    if effective_strategy == "post_restaurant":
+        import psycopg2.extras as _extras
+        _conn = psycopg2.connect(db_url)
+        try:
+            with _conn.cursor(cursor_factory=_extras.RealDictCursor) as _cur:
+                _cur.execute(
+                    "SELECT id, name, ST_Y(location) AS lat, ST_X(location) AS lon "
+                    "FROM robotics.restaurants"
+                )
+                from delivery_generator import Location
+                post_restaurants = [
+                    Location(db_id=r["id"], lat=r["lat"], lon=r["lon"], name=r["name"])
+                    for r in _cur.fetchall()
+                ]
+        finally:
+            _conn.close()
+
+        # Precompute each restaurant's road-graph node so the dispatcher can
+        # exclude posts that would be a zero-distance (same-node) move — the
+        # cause of the post_restaurant clock-freeze. Per-item scalar call, the
+        # same form used elsewhere in the engine.
+        for loc in post_restaurants:
+            loc.node = int(ox.nearest_nodes(G, loc.lon, loc.lat))
+
+        logger.info("Loaded %d restaurants for post_restaurant strategy", len(post_restaurants))
+
+    # Same node-collision guard for user-defined post locations (post_location
+    # strategy): tag each with its road-graph node so the dispatcher can skip
+    # no-op (same-node) repositioning just like it does for restaurants.
+    if post_locations_cfg:
+        for p in post_locations_cfg:
+            p["node"] = int(ox.nearest_nodes(G, p["lon"], p["lat"]))
+
+    dispatcher = Dispatcher(
+        idle_strategy=effective_strategy,
+        post_restaurants=post_restaurants,
+        post_locations=post_locations_cfg,
+    )
 
     def sim_clock(env, db_writer, until):
         """
@@ -191,6 +239,60 @@ def run_simulation(
 
     logger.info("Simulation %d running until t=%.0f min ...", sim_id, duration_min)
 
+    # --- Hang watchdog -------------------------------------------------------
+    # A stalled run = env.now stops advancing because some process spins without
+    # yielding (the main thread is then stuck inside env.run(), so it can't
+    # report anything itself). We watch from a daemon thread: if sim time hasn't
+    # moved for STALL_WALL_S wall-seconds while the run is unfinished, we dump
+    # every thread's stack (pinpointing the exact spinning line) plus a snapshot
+    # of robot and dispatcher state. This is the primary tool for locating the
+    # core issue behind the frontend stall warning.
+    import faulthandler as _faulthandler
+    import threading as _threading
+    import sys as _sys
+    import time as _time
+
+    _wd = {"now": -1.0, "since": _time.monotonic(), "stop": False, "dumped": False}
+
+    def _watchdog():
+        STALL_WALL_S = 15.0
+        while not _wd["stop"]:
+            _time.sleep(2.0)
+            if _wd["stop"]:
+                break
+            cur = env.now
+            if cur != _wd["now"]:
+                _wd["now"]    = cur
+                _wd["since"]  = _time.monotonic()
+                _wd["dumped"] = False
+                continue
+            stalled = _time.monotonic() - _wd["since"]
+            if stalled >= STALL_WALL_S and not _wd["dumped"]:
+                logger.error(
+                    "WATCHDOG: sim %d STALLED — env.now stuck at %.4f for %.0fs",
+                    sim_id, cur, stalled,
+                )
+                try:
+                    logger.error(
+                        "WATCHDOG dispatcher: idle=%d pending=%d claimed_posts=%s strategy=%s",
+                        len(dispatcher._idle_robots), len(dispatcher._pending),
+                        dict(dispatcher._claimed_posts), dispatcher._idle_strategy,
+                    )
+                    for rb in robots:
+                        logger.error(
+                            "WATCHDOG robot %d: pos=(%.6f,%.6f) node=%s inbox=%d",
+                            rb.index, rb.current_lat, rb.current_lon,
+                            rb.current_node, len(rb.inbox.items),
+                        )
+                except Exception as _e:
+                    logger.error("WATCHDOG snapshot failed: %s", _e)
+                # All-thread stack dump — shows the exact line the engine is on.
+                _faulthandler.dump_traceback(file=_sys.stderr, all_threads=True)
+                _wd["dumped"] = True
+
+    _wd_thread = _threading.Thread(target=_watchdog, name="sim-watchdog", daemon=True)
+    _wd_thread.start()
+
     # Run in chunks so we can detect a user-triggered stop between steps.
     # For fast-mode each chunk completes instantly; for real-time a 10-min chunk
     # takes 10/speed_factor wall-clock seconds, so stop latency is at most that.
@@ -216,6 +318,9 @@ def run_simulation(
             stopped_early = True
             break
 
+    # Stop the hang watchdog now that the env.run loop has exited normally.
+    _wd["stop"] = True
+
     if not stopped_early:
         logger.info("Simulation %d complete at t=%.1f min", sim_id, env.now)
 
@@ -231,6 +336,26 @@ def run_simulation(
         "Simulation %d finalized — %d deliveries, %.1f km",
         sim_id, total_deliveries, total_distance_km,
     )
+
+    # --- Export to DuckDB for analysis view ---------------------------------
+    # Only export simulations that ran to natural completion.
+    # User-stopped runs have incomplete data (missing the tail end of deliveries
+    # and robot locations) so they are excluded from DuckDB to keep analytics
+    # clean. They will still appear in the analysis view selector, marked as
+    # aborted, but their checkboxes will be disabled.
+    if not stopped_early:
+        try:
+            logger.info("Exporting simulation %d to DuckDB...", sim_id)
+            analytics.export_simulation(sim_id, db_url)
+            logger.info("DuckDB export complete for simulation %d", sim_id)
+        except Exception as exc:
+            logger.warning(
+                "DuckDB export failed for simulation %d (non-fatal): %s", sim_id, exc
+            )
+    else:
+        logger.info(
+            "Simulation %d was stopped early — skipping DuckDB export", sim_id
+        )
 
 
 # ------------------------------------------------------------------

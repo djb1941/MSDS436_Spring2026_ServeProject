@@ -23,6 +23,7 @@ from shapely.geometry import LineString, Point
 from shapely.ops import substring
 
 from delivery_generator import DeliveryRequest
+from dispatcher import IdlePostCommand
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +75,34 @@ class RobotAgent:
 
     def run(self):
         """Infinite delivery loop — runs for the lifetime of the simulation."""
+        # DIAGNOSTIC: zero-time loop guard. A healthy iteration always advances
+        # sim time (it yields a travel/pickup timeout). If this loop spins many
+        # times at the SAME env.now, a process is repositioning/looping without
+        # ever yielding — the hang. We log full context and raise, converting a
+        # silent 100%-CPU freeze into a loud, traceable failure.
+        _loop_now    = -1.0
+        _loop_count  = 0
+        _LOOP_LIMIT  = 50
         while True:
+            if self.env.now == _loop_now:
+                _loop_count += 1
+            else:
+                _loop_now   = self.env.now
+                _loop_count = 0
+            if _loop_count >= _LOOP_LIMIT:
+                logger.error(
+                    "ZERO-TIME LOOP: robot %d looped %d times at t=%.4f without "
+                    "advancing sim time. pos=(%.6f,%.6f) node=%s inbox=%d. "
+                    "Almost certainly a non-yielding reposition cycle.",
+                    self.index, _loop_count, self.env.now,
+                    self.current_lat, self.current_lon, self.current_node,
+                    len(self.inbox.items),
+                )
+                raise RuntimeError(
+                    f"Robot {self.index} stuck in zero-time loop at t={self.env.now} "
+                    f"pos=({self.current_lat:.6f},{self.current_lon:.6f})"
+                )
+
             # Tell the dispatcher this robot is available and clear its route line
             self.db_writer.log_movement(
                 robot_index=self.index,
@@ -86,8 +114,17 @@ class RobotAgent:
             self.db_writer.clear_route(self.index)
             self.dispatcher.robot_available(self)
 
-            # Wait for the dispatcher to assign a delivery
-            request: DeliveryRequest = yield self.inbox.get()
+            # Wait for the dispatcher to assign a delivery or a post command
+            item = yield self.inbox.get()
+
+            # --- Repositioning: travel to a standby post location -----------
+            if isinstance(item, IdlePostCommand):
+                yield from self._reposition(item)
+                # Loop back — signal availability again from the post location
+                continue
+
+            # --- Normal delivery --------------------------------------------
+            request: DeliveryRequest = item
 
             # The delivery row was written at generation time with robot_id=NULL.
             # Claim it now that the robot index is known.
@@ -218,6 +255,62 @@ class RobotAgent:
                 f"({total_dist_km:.2f} km, {total_duration_s}s) "
                 f"at t={self.env.now:.1f}min"
             )
+
+    # ------------------------------------------------------------------
+    # Repositioning — travel to an idle standby location
+    # ------------------------------------------------------------------
+
+    def _reposition(self, cmd: IdlePostCommand):
+        """
+        SimPy sub-generator: travel to the post location in cmd.
+        Uses the same routing logic as a normal delivery leg but logs
+        status='repositioning' so it shows distinctly in the DB / frontend.
+
+        Yields SimPy timeouts; called with 'yield from' inside run().
+        """
+        dest_node = ox.nearest_nodes(self.G, cmd.lon, cmd.lat)
+        leg_time, leg_dist, leg_path = self._route_info(self.current_node, dest_node)
+
+        if leg_path:
+            origin_stub = self._edge_stub(
+                self.current_lat, self.current_lon,
+                leg_path[0],
+            )
+            dest_stub = self._edge_stub(
+                cmd.lat, cmd.lon,
+                leg_path[-1],
+            )
+            waypoints = (
+                origin_stub[:-1]
+                + self._path_waypoints(leg_path)
+                + list(reversed(dest_stub))[1:]
+            )
+            self.db_writer.update_route(
+                self.index, "to_post",
+                waypoints,
+                self.env.now * 60,
+            )
+
+        self.db_writer.log_movement(
+            robot_index=self.index,
+            lat=self.current_lat,
+            lon=self.current_lon,
+            sim_timestamp=self.env.now * 60,
+            status="repositioning",
+        )
+
+        # Always yield — even a zero-time timeout hands control back to SimPy's
+        # event loop, preventing a busy-loop if the robot is already on-site.
+        yield self.env.timeout(max(leg_time, 0) / 60)
+
+        self.current_lat  = cmd.lat
+        self.current_lon  = cmd.lon
+        self.current_node = dest_node
+
+        logger.debug(
+            f"Robot {self.index} posted at '{cmd.name}' "
+            f"({cmd.lat:.5f}, {cmd.lon:.5f}) at t={self.env.now:.1f}min"
+        )
 
     # ------------------------------------------------------------------
     # Routing helpers

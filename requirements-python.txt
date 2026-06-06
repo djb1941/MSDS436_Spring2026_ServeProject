@@ -3,8 +3,6 @@ sqlalchemy
 geopandas
 shapely
 requests
-pandas
-numpy
 python-dotenv
 polars
 duckdb
@@ -18,3 +16,4 @@ flet
 flet-map
 httpx
 websockets
+matplotlib
